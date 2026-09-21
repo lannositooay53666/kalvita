@@ -9,10 +9,17 @@ pub enum BinaryOperator {
     Divide,
     Equal,
     NotEqual,
+    And,
+    Or,
     Greater,
     Less,
     GreaterEqual,
     LessEqual,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum UnaryOperator {
+    Not,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -36,6 +43,10 @@ pub enum Value {
         left: Box<Value>,
         op: BinaryOperator,
         right: Box<Value>,
+    },
+    Unary {
+        op: UnaryOperator,
+        value: Box<Value>,
     },
     Function {
         params: Vec<String>,
@@ -278,6 +289,47 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Value, String> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(Token::Or)) {
+            self.index += 1;
+            let right = self.parse_and()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::Or,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_unary()?;
+        while matches!(self.peek(), Some(Token::And)) {
+            self.index += 1;
+            let right = self.parse_unary()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::And,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<Value, String> {
+        if matches!(self.peek(), Some(Token::Not)) {
+            self.index += 1;
+            let value = self.parse_unary()?;
+            return Ok(Value::Unary {
+                op: UnaryOperator::Not,
+                value: Box::new(value),
+            });
+        }
+
         self.parse_comparison()
     }
 
@@ -593,6 +645,23 @@ fn invoke_function(
             println!("{}", rendered.join(" "));
             Ok(None)
         }
+        Some(obj) if obj == "math" => {
+            let value = match args {
+                [arg] => resolve_value(arg, environment)?,
+                _ => return Err(format!("{} expects exactly one argument", function)),
+            };
+            let number = match value {
+                Value::Number(value) => value,
+                _ => return Err(format!("{} expects a numeric argument", function)),
+            };
+
+            match function {
+                "Sin" => Ok(Some(Value::Number(number.sin()))),
+                "Cos" => Ok(Some(Value::Number(number.cos()))),
+                "Tan" => Ok(Some(Value::Number(number.tan()))),
+                _ => Err(format!("Unknown math function: {}", function)),
+            }
+        }
         _ => {
             let callee = if object.is_some() {
                 let obj = object.unwrap();
@@ -735,7 +804,17 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             let right_value = resolve_value(right, environment)?;
             evaluate_binary(left_value, right_value, op)
         }
+        Value::Unary { op, value } => {
+            let inner = resolve_value(value, environment)?;
+            evaluate_unary(inner, op)
+        }
         _ => Ok(value.clone()),
+    }
+}
+
+fn evaluate_unary(value: Value, op: &UnaryOperator) -> Result<Value, String> {
+    match op {
+        UnaryOperator::Not => Ok(Value::Logic(!is_truthy(&value))),
     }
 }
 
@@ -774,6 +853,8 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
         },
         BinaryOperator::Equal => Ok(Value::Logic(left == right)),
         BinaryOperator::NotEqual => Ok(Value::Logic(left != right)),
+        BinaryOperator::And => Ok(Value::Logic(is_truthy(&left) && is_truthy(&right))),
+        BinaryOperator::Or => Ok(Value::Logic(is_truthy(&left) || is_truthy(&right))),
         BinaryOperator::Greater => match (left, right) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a > b)),
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a > b)),
@@ -866,6 +947,7 @@ fn format_value(value: Value) -> String {
         Value::FunctionCall { .. } => "<function-call>".to_string(),
         Value::Index { .. } => "<index>".to_string(),
         Value::Binary { .. } => "<expression>".to_string(),
+        Value::Unary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
     }
 }
@@ -1010,6 +1092,69 @@ mod tests {
 
         let result = resolve_value(&Value::Variable("score".to_string()), &environment);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn logic_gate_operations_work() {
+        let mut environment = HashMap::new();
+        environment.insert("var.active".to_string(), Value::Logic(true));
+        environment.insert("var.ready".to_string(), Value::Logic(true));
+        environment.insert("var.blocked".to_string(), Value::Logic(false));
+
+        let and_result = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.active".to_string())),
+                op: BinaryOperator::And,
+                right: Box::new(Value::Variable("var.ready".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(and_result, Value::Logic(true));
+
+        let or_result = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.blocked".to_string())),
+                op: BinaryOperator::Or,
+                right: Box::new(Value::Variable("var.active".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(or_result, Value::Logic(true));
+
+        let not_result = resolve_value(
+            &Value::Unary {
+                op: UnaryOperator::Not,
+                value: Box::new(Value::Variable("var.blocked".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(not_result, Value::Logic(true));
+    }
+
+    #[test]
+    fn trigonometric_functions_work() {
+        let environment = HashMap::new();
+
+        let sin_result = invoke_function(Some("math"), "Sin", &[Value::Number(0.0)], &environment).unwrap().unwrap();
+        match sin_result {
+            Value::Number(value) => assert!((value - 0.0).abs() < 1e-9),
+            _ => panic!("Sin should return a number"),
+        }
+
+        let cos_result = invoke_function(Some("math"), "Cos", &[Value::Number(0.0)], &environment).unwrap().unwrap();
+        match cos_result {
+            Value::Number(value) => assert!((value - 1.0).abs() < 1e-9),
+            _ => panic!("Cos should return a number"),
+        }
+
+        let tan_result = invoke_function(Some("math"), "Tan", &[Value::Number(0.0)], &environment).unwrap().unwrap();
+        match tan_result {
+            Value::Number(value) => assert!((value - 0.0).abs() < 1e-9),
+            _ => panic!("Tan should return a number"),
+        }
     }
 
     #[test]

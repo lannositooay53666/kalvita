@@ -19,6 +19,9 @@ pub enum Token {
     Assign,
     Equal,
     NotEqual,
+    And,
+    Or,
+    Not,
     GreaterThan,
     LessThan,
     GreaterEqual,
@@ -152,7 +155,26 @@ impl Lexer {
                         self.advance();
                         tokens.push(Token::NotEqual);
                     } else {
-                        panic!("Unexpected character in lexer: '!' ");
+                        self.advance();
+                        tokens.push(Token::Not);
+                    }
+                }
+                '&' => {
+                    if self.peek_next() == Some('&') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::And);
+                    } else {
+                        panic!("Unexpected character in lexer: '&'");
+                    }
+                }
+                '|' => {
+                    if self.peek_next() == Some('|') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::Or);
+                    } else {
+                        panic!("Unexpected character in lexer: '|'");
                     }
                 }
                 '.' => {
@@ -183,6 +205,9 @@ impl Lexer {
                         "else" => Token::Else,
                         "true" => Token::BoolLiteral(true),
                         "false" => Token::BoolLiteral(false),
+                        "and" => Token::And,
+                        "or" => Token::Or,
+                        "not" => Token::Not,
                         "string" => Token::StringType,
                         "number" => Token::NumberType,
                         "logic" => Token::LogicType,
