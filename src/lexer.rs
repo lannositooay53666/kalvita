@@ -109,11 +109,7 @@ impl Lexer {
                 }
                 '/' => {
                     if self.peek_next() == Some('/') {
-                        self.advance();
-                        self.advance();
-                        while !self.is_at_end() && self.peek() != Some('\n') {
-                            self.advance();
-                        }
+                        self.skip_line_comment();
                     } else {
                         self.advance();
                         tokens.push(Token::Slash);
@@ -159,12 +155,8 @@ impl Lexer {
                     }
                 }
                 '.' => {
-                    if self.peek_next() == Some('/') {
-                        self.advance();
-                        self.advance();
-                        while !self.is_at_end() && self.peek() != Some('\n') {
-                            self.advance();
-                        }
+                    if self.peek_next() == Some('/') && self.peek_next_next() == Some('/') {
+                        self.skip_block_comment();
                     } else {
                         self.advance();
                         tokens.push(Token::Dot);
@@ -217,6 +209,34 @@ impl Lexer {
 
     fn peek_next(&self) -> Option<char> {
         self.source.get(self.position + 1).copied()
+    }
+
+    fn peek_next_next(&self) -> Option<char> {
+        self.source.get(self.position + 2).copied()
+    }
+
+    fn skip_line_comment(&mut self) {
+        self.advance();
+        self.advance();
+        while !self.is_at_end() && self.peek() != Some('\n') {
+            self.advance();
+        }
+    }
+
+    fn skip_block_comment(&mut self) {
+        self.advance();
+        self.advance();
+        self.advance();
+        while !self.is_at_end() {
+            if self.peek() == Some('/') && self.peek_next() == Some('/') && self.peek_next_next() == Some('.') {
+                self.advance();
+                self.advance();
+                self.advance();
+                return;
+            }
+            self.advance();
+        }
+        panic!("Unterminated block comment");
     }
 
     fn advance(&mut self) -> Option<char> {
@@ -308,5 +328,28 @@ mod tests {
         assert!(tokens.contains(&Token::LParen));
         assert!(tokens.contains(&Token::Identifier("wow".to_string())));
         assert!(tokens.contains(&Token::RParen));
+    }
+
+    #[test]
+    fn ignores_single_line_and_block_comments() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\n// single line comment\nkal.OnStart {\n    .// multi\n    line\n    comment //.\n    var local wow string = \"Hello world\"\n}\n";
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+
+        assert!(!tokens.iter().any(|token| matches!(token, Token::Identifier(name) if name == "single" || name == "line" || name == "multi" || name == "comment")));
+        assert!(tokens.contains(&Token::LBracket));
+        assert!(tokens.contains(&Token::Identifier("SCRIPTTYPE".to_string())));
+        assert!(tokens.contains(&Token::Identifier("KALVITA".to_string())));
+        assert!(tokens.contains(&Token::Identifier("VERSION".to_string())));
+        assert!(tokens.contains(&Token::NumberLiteral(1.0)));
+        assert!(tokens.contains(&Token::Identifier("kal".to_string())));
+        assert!(tokens.contains(&Token::Dot));
+        assert!(tokens.contains(&Token::Identifier("OnStart".to_string())));
+        assert!(tokens.contains(&Token::LBrace));
+        assert!(tokens.contains(&Token::Var));
+        assert!(tokens.contains(&Token::Local));
+        assert!(tokens.contains(&Token::StringType));
+        assert!(tokens.contains(&Token::Assign));
+        assert!(tokens.contains(&Token::StringLiteral("Hello world".to_string())));
     }
 }

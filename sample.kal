@@ -15,6 +15,11 @@ kal.OnStart {
     var local repeatArr array = [12, 42, 6, 2]
     var local repeatOffset array = [11, 6]
 
+    // ignored by the lexer
+
+    .// also
+    ignored //.
+
     con.Print("====================================================")
     con.Print("Kalvita bootstrap test script")
     con.Print("====================================================")
