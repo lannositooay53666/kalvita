@@ -15,6 +15,7 @@ pub enum Token {
     NumberType,
     LogicType,
     FunctionType,
+    ObjectType,
     Identifier(String),
     Assign,
     Equal,
@@ -27,6 +28,7 @@ pub enum Token {
     GreaterEqual,
     LessEqual,
     Dot,
+    Colon,
     LParen,
     RParen,
     LBrace,
@@ -177,6 +179,10 @@ impl Lexer {
                         panic!("Unexpected character in lexer: '|'");
                     }
                 }
+                ':' => {
+                    self.advance();
+                    tokens.push(Token::Colon);
+                }
                 '.' => {
                     if self.peek_next() == Some('/') && self.peek_next_next() == Some('/') {
                         self.skip_block_comment();
@@ -211,6 +217,7 @@ impl Lexer {
                         "string" => Token::StringType,
                         "number" => Token::NumberType,
                         "logic" => Token::LogicType,
+                        "object" => Token::ObjectType,
                         "array" => Token::ArrayType,
                         _ => Token::Identifier(ident),
                     };

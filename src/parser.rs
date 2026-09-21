@@ -29,6 +29,7 @@ pub enum Value {
     String(String),
     Logic(bool),
     Variable(String),
+    Object(HashMap<String, Value>),
     Array(Vec<Value>),
     Index {
         target: Box<Value>,
@@ -43,6 +44,10 @@ pub enum Value {
         left: Box<Value>,
         op: BinaryOperator,
         right: Box<Value>,
+    },
+    Property {
+        target: Box<Value>,
+        key: String,
     },
     Unary {
         op: UnaryOperator,
@@ -451,6 +456,7 @@ impl Parser {
                 }
             }
             Some(Token::LBracket) => self.parse_array_literal()?,
+            Some(Token::LBrace) => self.parse_object_literal()?,
             Some(Token::LParen) => {
                 self.index += 1;
                 let value = self.parse_expression()?;
@@ -459,6 +465,15 @@ impl Parser {
             }
             _ => return Err(format!("Expected value, found {:?}", self.peek())),
         };
+
+        while matches!(self.peek(), Some(Token::Dot)) {
+            self.expect(Token::Dot)?;
+            let key = self.consume_identifier()?;
+            value = Value::Property {
+                target: Box::new(value),
+                key,
+            };
+        }
 
         while matches!(self.peek(), Some(Token::LBracket)) {
             self.expect(Token::LBracket)?;
@@ -471,6 +486,42 @@ impl Parser {
         }
 
         Ok(value)
+    }
+
+    fn parse_object_literal(&mut self) -> Result<Value, String> {
+        self.expect(Token::LBrace)?;
+        let mut object = HashMap::new();
+
+        if !matches!(self.peek(), Some(Token::RBrace)) {
+            loop {
+                let key = match self.peek() {
+                    Some(Token::StringLiteral(value)) => {
+                        let key = value.clone();
+                        self.index += 1;
+                        key
+                    }
+                    _ => self.consume_identifier()?,
+                };
+                self.expect(Token::Colon)?;
+                let value = self.parse_value()?;
+                object.insert(key, value);
+
+                if self.match_token(Token::Comma) {
+                    continue;
+                }
+
+                if matches!(self.peek(), Some(Token::RBrace)) {
+                    break;
+                }
+
+                if self.peek().is_some() {
+                    continue;
+                }
+            }
+        }
+
+        self.expect(Token::RBrace)?;
+        Ok(Value::Object(object))
     }
 
     fn parse_array_literal(&mut self) -> Result<Value, String> {
@@ -546,6 +597,10 @@ impl Parser {
             Some(Token::ArrayType) => {
                 self.index += 1;
                 Ok("array".to_string())
+            }
+            Some(Token::ObjectType) => {
+                self.index += 1;
+                Ok("object".to_string())
             }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -663,21 +718,22 @@ fn invoke_function(
             }
         }
         _ => {
-            let callee = if object.is_some() {
-                let obj = object.unwrap();
-                resolve_value(&Value::Variable(obj.to_string()), environment)
-                    .or_else(|_| environment.get(&format!("var.{}", obj)).map(|v| Ok(v.clone())).unwrap_or_else(|| Err(format!("Unknown variable: {}", obj))))?
-            } else {
-                resolve_value(&Value::Variable(function.to_string()), environment)
-                    .or_else(|_| {
-                        let prefixed = format!("var.{}", function);
-                        environment.get(&prefixed).map(|v| Ok(v.clone())).unwrap_or_else(|| Err(format!("Unknown variable: {}", function)))
-                    })?
+            let passed_value = match object {
+                Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment)
+                    .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| format!("Unknown variable: {}", obj)))?,
+                None => Value::Null,
             };
+
+            let callee = resolve_value(&Value::Variable(function.to_string()), environment)
+                .or_else(|_| {
+                    let prefixed = format!("var.{}", function);
+                    environment.get(&prefixed).cloned().ok_or_else(|| format!("Unknown variable: {}", function))
+                })?;
 
             match callee {
                 Value::Function { params, body } => {
                     let mut local_env = environment.clone();
+                    local_env.insert("pass".to_string(), passed_value);
                     for (param, arg) in params.iter().zip(args.iter()) {
                         let value = resolve_value(arg, environment)?;
                         let scoped = format!("arg.{}", param);
@@ -760,6 +816,10 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
 }
 
 fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Option<Value> {
+    if name == "pass" {
+        return environment.get("pass").cloned();
+    }
+
     if name.starts_with("var.") || name.starts_with("arg.") {
         return environment.get(name).cloned();
     }
@@ -776,6 +836,14 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             match result {
                 Some(value) => Ok(value),
                 None => Ok(Value::Null),
+            }
+        }
+        Value::Property { target, key } => {
+            let target_value = resolve_value(target, environment)?;
+            match target_value {
+                Value::Object(map) => map.get(key).cloned().ok_or_else(|| format!("Unknown property: {}", key)),
+                Value::Null => Ok(Value::Null),
+                other => Err(format!("Property access requires an object, got {:?}", other)),
             }
         }
         Value::Index { target, index } => {
@@ -947,6 +1015,14 @@ fn format_value(value: Value) -> String {
         Value::FunctionCall { .. } => "<function-call>".to_string(),
         Value::Index { .. } => "<index>".to_string(),
         Value::Binary { .. } => "<expression>".to_string(),
+        Value::Property { .. } => "<property>".to_string(),
+        Value::Object(object) => {
+            let rendered: Vec<String> = object
+                .iter()
+                .map(|(key, value)| format!("{}: {}", key, format_value(value.clone())))
+                .collect();
+            format!("{{{}}}", rendered.join(", "))
+        }
         Value::Unary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
     }
@@ -1155,6 +1231,37 @@ mod tests {
             Value::Number(value) => assert!((value - 0.0).abs() < 1e-9),
             _ => panic!("Tan should return a number"),
         }
+    }
+
+    #[test]
+    fn object_values_and_pass_work() {
+        let mut environment = HashMap::new();
+        environment.insert(
+            "var.enemy".to_string(),
+            Value::Object(HashMap::from([
+                ("health".to_string(), Value::Number(40.0)),
+                ("damage".to_string(), Value::Number(5.0)),
+                ("speed".to_string(), Value::Number(10.0)),
+            ])),
+        );
+        environment.insert(
+            "var.attack".to_string(),
+            Value::Function {
+                params: vec![],
+                body: vec![Statement::Return {
+                    value: Box::new(Value::Property {
+                        target: Box::new(Value::Variable("pass".to_string())),
+                        key: "health".to_string(),
+                    }),
+                }],
+            },
+        );
+
+        let result = invoke_function(Some("enemy"), "attack", &[], &environment).unwrap().unwrap();
+        assert_eq!(result, Value::Number(40.0));
+
+        let null_result = invoke_function(None, "attack", &[], &environment).unwrap().unwrap();
+        assert_eq!(null_result, Value::Null);
     }
 
     #[test]
