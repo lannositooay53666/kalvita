@@ -1,19 +1,29 @@
 #[derive(Debug, PartialEq, Clone)]
 pub enum Token {
-    Let,
-    Fn,
+    Var,
+    Local,
+    Null,
+    BoolLiteral(bool),
+    NumberLiteral(f64),
+    StringLiteral(String),
+    StringType,
+    NumberType,
+    LogicType,
     Identifier(String),
-    Number(i64),
     Assign,
-    Semicolon,
+    Equal,
+    Dot,
     LParen,
     RParen,
-    Comma,
-    Arrow,
-    Type(String),
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
+    Comma,
     Plus,
+    Minus,
+    Slash,
+    Semicolon,
     Eof,
 }
 
@@ -35,17 +45,27 @@ impl Lexer {
         let mut tokens = Vec::new();
 
         while !self.is_at_end() {
-            match self.peek().unwrap() {
+            let ch = self.peek().unwrap();
+
+            match ch {
                 ' ' | '\n' | '\r' | '\t' => {
                     self.advance();
                 }
-                '=' => {
+                '[' => {
                     self.advance();
-                    tokens.push(Token::Assign);
+                    tokens.push(Token::LBracket);
                 }
-                ';' => {
+                ']' => {
                     self.advance();
-                    tokens.push(Token::Semicolon);
+                    tokens.push(Token::RBracket);
+                }
+                '{' => {
+                    self.advance();
+                    tokens.push(Token::LBrace);
+                }
+                '}' => {
+                    self.advance();
+                    tokens.push(Token::RBrace);
                 }
                 '(' => {
                     self.advance();
@@ -59,51 +79,76 @@ impl Lexer {
                     self.advance();
                     tokens.push(Token::Comma);
                 }
-                '{' => {
+                ';' => {
                     self.advance();
-                    tokens.push(Token::LBrace);
-                }
-                '}' => {
-                    self.advance();
-                    tokens.push(Token::RBrace);
+                    tokens.push(Token::Semicolon);
                 }
                 '+' => {
                     self.advance();
                     tokens.push(Token::Plus);
                 }
                 '-' => {
-                    if self.peek_next() == Some('>') {
+                    self.advance();
+                    tokens.push(Token::Minus);
+                }
+                '/' => {
+                    if self.peek_next() == Some('/') {
                         self.advance();
                         self.advance();
-                        tokens.push(Token::Arrow);
+                        while !self.is_at_end() && self.peek() != Some('\n') {
+                            self.advance();
+                        }
                     } else {
                         self.advance();
-                        tokens.push(Token::Type("-".to_string()));
+                        tokens.push(Token::Slash);
                     }
                 }
-                _ if self.peek().unwrap().is_ascii_alphabetic() || self.peek().unwrap() == '_' => {
-                    let ident = self.read_identifier();
-                    let keyword = match ident.as_str() {
-                        "let" => Token::Let,
-                        "fn" => Token::Fn,
-                        _ => {
-                            if matches!(ident.as_str(), "int" | "float" | "str" | "bool") {
-                                Token::Type(ident)
-                            } else {
-                                Token::Identifier(ident)
-                            }
+                '=' => {
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::Equal);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::Assign);
+                    }
+                }
+                '.' => {
+                    if self.peek_next() == Some('/') {
+                        self.advance();
+                        self.advance();
+                        while !self.is_at_end() && self.peek() != Some('\n') {
+                            self.advance();
                         }
+                    } else {
+                        self.advance();
+                        tokens.push(Token::Dot);
+                    }
+                }
+                '"' => {
+                    let value = self.read_string();
+                    tokens.push(Token::StringLiteral(value));
+                }
+                _ if ch.is_ascii_digit() => {
+                    tokens.push(Token::NumberLiteral(self.read_number()));
+                }
+                _ if ch.is_ascii_alphabetic() || ch == '_' => {
+                    let ident = self.read_identifier();
+                    let token = match ident.as_str() {
+                        "var" => Token::Var,
+                        "local" => Token::Local,
+                        "null" => Token::Null,
+                        "true" => Token::BoolLiteral(true),
+                        "false" => Token::BoolLiteral(false),
+                        "string" => Token::StringType,
+                        "number" => Token::NumberType,
+                        "logic" => Token::LogicType,
+                        _ => Token::Identifier(ident),
                     };
-                    tokens.push(keyword);
+                    tokens.push(token);
                 }
-                _ if self.peek().unwrap().is_ascii_digit() => {
-                    let value = self.read_number();
-                    tokens.push(Token::Number(value));
-                }
-                ch => {
-                    let unexpected = ch;
-                    self.advance();
-                    panic!("Unexpected character in lexer: '{}'", unexpected);
+                _ => {
+                    panic!("Unexpected character in lexer: '{}'", ch);
                 }
             }
         }
@@ -144,10 +189,10 @@ impl Lexer {
         self.source[start..self.position].iter().collect()
     }
 
-    fn read_number(&mut self) -> i64 {
+    fn read_number(&mut self) -> f64 {
         let start = self.position;
         while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
+            if ch.is_ascii_digit() || ch == '.' {
                 self.advance();
             } else {
                 break;
@@ -156,6 +201,33 @@ impl Lexer {
         let value: String = self.source[start..self.position].iter().collect();
         value.parse().unwrap()
     }
+
+    fn read_string(&mut self) -> String {
+        self.advance();
+        let mut value = String::new();
+        while let Some(ch) = self.peek() {
+            if ch == '"' {
+                self.advance();
+                return value;
+            }
+            if ch == '\\' {
+                self.advance();
+                if let Some(next) = self.peek() {
+                    match next {
+                        'n' => value.push('\n'),
+                        '"' => value.push('"'),
+                        '\\' => value.push('\\'),
+                        _ => value.push(next),
+                    }
+                    self.advance();
+                    continue;
+                }
+            }
+            value.push(ch);
+            self.advance();
+        }
+        panic!("Unterminated string literal");
+    }
 }
 
 #[cfg(test)]
@@ -163,30 +235,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lexes_basic_kalvita_program() {
-        let mut lexer = Lexer::new("let x = 42;\nfn add(a, b) -> int { a + b }");
-
+    fn lexes_header_and_kal_event() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local wow string = \"Hello world\"\n    con.Print(wow)\n}\n";
+        let mut lexer = Lexer::new(source);
         let tokens = lexer.tokenize();
-        assert_eq!(tokens.len(), 20);
-        assert_eq!(tokens[0], Token::Let);
-        assert_eq!(tokens[1], Token::Identifier("x".to_string()));
-        assert_eq!(tokens[2], Token::Assign);
-        assert_eq!(tokens[3], Token::Number(42));
-        assert_eq!(tokens[4], Token::Semicolon);
-        assert_eq!(tokens[5], Token::Fn);
-        assert_eq!(tokens[6], Token::Identifier("add".to_string()));
-        assert_eq!(tokens[7], Token::LParen);
-        assert_eq!(tokens[8], Token::Identifier("a".to_string()));
-        assert_eq!(tokens[9], Token::Comma);
-        assert_eq!(tokens[10], Token::Identifier("b".to_string()));
-        assert_eq!(tokens[11], Token::RParen);
-        assert_eq!(tokens[12], Token::Arrow);
-        assert_eq!(tokens[13], Token::Type("int".to_string()));
-        assert_eq!(tokens[14], Token::LBrace);
-        assert_eq!(tokens[15], Token::Identifier("a".to_string()));
-        assert_eq!(tokens[16], Token::Plus);
-        assert_eq!(tokens[17], Token::Identifier("b".to_string()));
-        assert_eq!(tokens[18], Token::RBrace);
-        assert_eq!(tokens[19], Token::Eof);
+
+        assert!(tokens.contains(&Token::LBracket));
+        assert!(tokens.contains(&Token::Identifier("SCRIPTTYPE".to_string())));
+        assert!(tokens.contains(&Token::Identifier("KALVITA".to_string())));
+        assert!(tokens.contains(&Token::Identifier("VERSION".to_string())));
+        assert!(tokens.contains(&Token::NumberLiteral(1.0)));
+        assert!(tokens.contains(&Token::Identifier("kal".to_string())));
+        assert!(tokens.contains(&Token::Dot));
+        assert!(tokens.contains(&Token::Identifier("OnStart".to_string())));
+        assert!(tokens.contains(&Token::LBrace));
+        assert!(tokens.contains(&Token::Var));
+        assert!(tokens.contains(&Token::Local));
+        assert!(tokens.contains(&Token::StringType));
+        assert!(tokens.contains(&Token::Assign));
+        assert!(tokens.contains(&Token::StringLiteral("Hello world".to_string())));
+        assert!(tokens.contains(&Token::Identifier("con".to_string())));
+        assert!(tokens.contains(&Token::LParen));
+        assert!(tokens.contains(&Token::Identifier("wow".to_string())));
+        assert!(tokens.contains(&Token::RParen));
     }
 }
