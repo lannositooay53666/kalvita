@@ -1,0 +1,5 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    var local wow string = "Hello world"
+    con.Print(wow)
+}
