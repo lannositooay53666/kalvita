@@ -49,8 +49,10 @@ kal.OnStart {
     }
 
     var local add function = (a, b) {
-        con.Print("sum inputs = ", a, b)
+        con.Print("Adding ", a, " and ", b)
+        return(a + b)
     }
+
 
     var local greetAndCount function = (name, numberValue) {
         con.Print("Name: ", name)
@@ -62,7 +64,7 @@ kal.OnStart {
     con.Print("Function demos")
     con.Print("----------------------------------------------------")
     sayHi("Nova")
-    add(10, 32)
+    con.Print(add(15 + 2)) // 17
     greetAndCount("Kael", 99)
 
     var local tagged string = "prototype"
