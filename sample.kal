@@ -1,6 +1,7 @@
 [SCRIPTTYPE KALVITA VERSION 1]
 kal.OnStart {
-    var local greeting string = "Hello from Kalvita"
+    // Basic variables and constants
+    var local hello string = "Hello from Kalvita"
     var local count number = 7
     var local enabled logic = true
     var local empty null = null
@@ -8,72 +9,69 @@ kal.OnStart {
     var local version string = "v1 prototype"
     var local score number = 10
     var local bonus number = 3
-    var local items array = ["apple", "banana", "orange", "pear"]
+
+    // Arrays and list values
+    var local fruits array = ["apple", "banana", "orange", "pear"]
     var local nums array = [12, 64, 9, 747]
     var local combo array = [12, 53, 5, 23]
     var local offsets array = [10, 32, 6, 3]
-    var local repeatArr array = [12, 42, 6, 2]
-    var local repeatOffset array = [11, 6]
+    var local repeatLeft array = [12, 42, 6, 2]
+    var local repeatRight array = [11, 6]
 
-    // ignored by the lexer
+    // Multi-line block comments are ignored by the lexer
+    .// These lines are skipped
+    This text is not tokenized //.
 
-    .// also
-    ignored //.
-
-    con.Print("====================================================")
-    con.Print("Kalvita bootstrap test script")
-    con.Print("====================================================")
-    con.Print("before redeclare score = ", score)
+    // Redeclaration updates the existing variable value
+    con.Print("before redeclare score = ", var.score)
     var local score number = 15
-    con.Print("after redeclare score = ", score)
-    con.Print("array items = ", items)
-    con.Print("array nums = ", nums)
-    con.Print("items[0] = ", items[0])
+    con.Print("after redeclare score = ", var.score)
+
+    // Array reading and scalar math
+    con.Print("fruits = ", fruits)
+    con.Print("nums = ", nums)
+    con.Print("fruits[0] = ", fruits[0])
     con.Print("nums + 10 = ", nums + 10)
     con.Print("nums * 2 = ", nums * 2)
     con.Print("combo + offsets = ", combo + offsets)
-    con.Print("repeatArr + repeatOffset = ", repeatArr + repeatOffset)
-    con.Print(greeting)
+    con.Print("repeatLeft + repeatRight = ", repeatLeft + repeatRight)
+
+    // String and arithmetic output
+    con.Print(hello)
     con.Print("count = ", count)
     con.Print("enabled = ", enabled)
-    con.Print("null check = ", empty)
+    con.Print("empty = ", empty)
     con.Print("mode = ", mode)
     con.Print("version = ", version)
-    con.Print("math = ", score + bonus)
-    con.Print("subtract = ", score - bonus)
-    con.Print("multiply = ", score * bonus)
-    con.Print("divide = ", score / bonus)
+    con.Print("score + bonus = ", score + bonus)
+    con.Print("score - bonus = ", score - bonus)
+    con.Print("score * bonus = ", score * bonus)
+    con.Print("score / bonus = ", score / bonus)
 
+    // Function-as-variable style
     var local sayHi function = (name) {
         con.Print("Hi, ", name, "! Welcome to Kalvita.")
     }
 
     var local add function = (a, b) {
-        con.Print("Adding ", a, " and ", b)
-        return(a + b)
+        con.Print("Adding ", arg.a, " and ", arg.b)
+        return(arg.a + arg.b)
     }
 
-
     var local greetAndCount function = (name, numberValue) {
-        con.Print("Name: ", name)
-        con.Print("Number: ", numberValue)
+        con.Print("Name: ", arg.name)
+        con.Print("Number: ", arg.numberValue)
         con.Print("Status: ", "ready")
     }
 
-    con.Print("----------------------------------------------------")
-    con.Print("Function demos")
-    con.Print("----------------------------------------------------")
-    sayHi("Nova")
-    con.Print(add(15 + 2)) // 17
-    greetAndCount("Kael", 99)
-
+    // Conditional blocks
     var local tagged string = "prototype"
     var local state string = "running"
     var local ready logic = true
 
-    if (score > 5) {
+    if (var.score > 5) {
         con.Print("score is greater than 5")
-    } elseif (score == 10) {
+    } elseif (var.score == 10) {
         con.Print("score is exactly 10")
     } else {
         con.Print("score is not greater than 5")
@@ -87,10 +85,20 @@ kal.OnStart {
         con.Print("system uncertain")
     }
 
-    con.Print("status: ", tagged)
-    con.Print("state: ", state)
-    con.Print("ready: ", ready)
+    // Function calls and return values
+    con.Print("----------------------------------------------------")
+    con.Print("Function demos")
+    con.Print("----------------------------------------------------")
+    sayHi("Nova")
+    con.Print("sum = ", add(15 + 2, 5))
+    greetAndCount("Kael", 99)
 
+    // Namespace-prefixed access
+    con.Print("var.score = ", var.score)
+    con.Print("state = ", state)
+    con.Print("ready = ", ready)
+
+    // More examples for function variables
     var local finalMessage function = () {
         con.Print("All prototype systems are online.")
         con.Print("The interpreter can store functions as variables.")
@@ -98,7 +106,6 @@ kal.OnStart {
     }
 
     finalMessage()
-    con.Print("====================================================")
-    con.Print("end of sample script")
+
     con.Print("====================================================")
 }

@@ -368,6 +368,12 @@ impl Parser {
                 self.index += 1;
                 Value::Null
             }
+            Some(Token::Var) => {
+                self.index += 1;
+                self.expect(Token::Dot)?;
+                let name = self.consume_identifier()?;
+                Value::Variable(format!("var.{}", name))
+            }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.index += 1;
@@ -377,6 +383,16 @@ impl Parser {
                         object: None,
                         function: name,
                         args,
+                    }
+                } else if self.matches(Token::Dot) {
+                    self.expect(Token::Dot)?;
+                    let scoped_name = self.consume_identifier()?;
+                    if name == "arg" {
+                        Value::Variable(format!("arg.{}", scoped_name))
+                    } else if name == "var" {
+                        Value::Variable(format!("var.{}", scoped_name))
+                    } else {
+                        Value::Variable(format!("{}.", name))
                     }
                 } else {
                     Value::Variable(name)
@@ -590,6 +606,8 @@ fn invoke_function(
                     let mut local_env = environment.clone();
                     for (param, arg) in params.iter().zip(args.iter()) {
                         let value = resolve_value(arg, environment)?;
+                        let scoped = format!("arg.{}", param);
+                        local_env.insert(scoped.clone(), value.clone());
                         local_env.insert(param.clone(), value);
                     }
 
@@ -618,6 +636,7 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
                 Value::Function { .. } => value.clone(),
                 _ => resolve_value(value, environment)?,
             };
+            environment.insert(format!("var.{}", name), resolved.clone());
             environment.insert(name.clone(), resolved);
         }
         Statement::FunctionCall { object, function, args } => {
@@ -668,11 +687,28 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
     Ok(())
 }
 
+fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Option<Value> {
+    if let Some(value) = environment.get(name) {
+        return Some(value.clone());
+    }
+
+    let scoped_options = [
+        format!("var.{}", name),
+        format!("arg.{}", name),
+    ];
+
+    for scoped in scoped_options {
+        if let Some(value) = environment.get(&scoped) {
+            return Some(value.clone());
+        }
+    }
+
+    None
+}
+
 fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<Value, String> {
     match value {
-        Value::Variable(name) => environment
-            .get(name)
-            .cloned()
+        Value::Variable(name) => resolve_variable_name(name, environment)
             .ok_or_else(|| format!("Unknown variable: {}", name)),
         Value::FunctionCall { object, function, args } => {
             let result = invoke_function(object.as_deref(), function, args, environment)?;
@@ -952,6 +988,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, Value::Number(17.0));
+    }
+
+    #[test]
+    fn namespaced_var_and_arg_access_parse_and_resolve() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local score number = 15\n    var local add function = (a, b) {\n        return(arg.a + arg.b)\n    }\n    con.Print(var.score)\n    con.Print(add(15 + 2))\n}\n";
+
+        let program = Parser::parse(source).unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+
+        let mut environment = HashMap::new();
+        environment.insert("var.score".to_string(), Value::Number(15.0));
+        environment.insert("arg.a".to_string(), Value::Number(7.0));
+        environment.insert("arg.b".to_string(), Value::Number(2.0));
+
+        let resolved = resolve_value(&Value::Variable("var.score".to_string()), &environment).unwrap();
+        assert_eq!(resolved, Value::Number(15.0));
+        let arg_a = resolve_value(&Value::Variable("arg.a".to_string()), &environment).unwrap();
+        assert_eq!(arg_a, Value::Number(7.0));
     }
 
     #[test]
