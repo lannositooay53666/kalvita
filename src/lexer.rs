@@ -4,6 +4,9 @@ pub enum Token {
     Local,
     Null,
     Function,
+    If,
+    ElseIf,
+    Else,
     BoolLiteral(bool),
     NumberLiteral(f64),
     StringLiteral(String),
@@ -14,6 +17,11 @@ pub enum Token {
     Identifier(String),
     Assign,
     Equal,
+    NotEqual,
+    GreaterThan,
+    LessThan,
+    GreaterEqual,
+    LessEqual,
     Dot,
     LParen,
     RParen,
@@ -24,6 +32,7 @@ pub enum Token {
     Comma,
     Plus,
     Minus,
+    Asterisk,
     Slash,
     Semicolon,
     Eof,
@@ -93,6 +102,10 @@ impl Lexer {
                     self.advance();
                     tokens.push(Token::Minus);
                 }
+                '*' => {
+                    self.advance();
+                    tokens.push(Token::Asterisk);
+                }
                 '/' => {
                     if self.peek_next() == Some('/') {
                         self.advance();
@@ -113,6 +126,35 @@ impl Lexer {
                     } else {
                         self.advance();
                         tokens.push(Token::Assign);
+                    }
+                }
+                '>' => {
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::GreaterEqual);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::GreaterThan);
+                    }
+                }
+                '<' => {
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::LessEqual);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::LessThan);
+                    }
+                }
+                '!' => {
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::NotEqual);
+                    } else {
+                        panic!("Unexpected character in lexer: '!' ");
                     }
                 }
                 '.' => {
@@ -141,6 +183,9 @@ impl Lexer {
                         "local" => Token::Local,
                         "null" => Token::Null,
                         "function" => Token::Function,
+                        "if" => Token::If,
+                        "elseif" => Token::ElseIf,
+                        "else" => Token::Else,
                         "true" => Token::BoolLiteral(true),
                         "false" => Token::BoolLiteral(false),
                         "string" => Token::StringType,

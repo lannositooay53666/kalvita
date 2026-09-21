@@ -2,12 +2,31 @@ use crate::lexer::{Lexer, Token};
 use std::collections::HashMap;
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum BinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Equal,
+    NotEqual,
+    Greater,
+    Less,
+    GreaterEqual,
+    LessEqual,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Value {
     Null,
     Number(f64),
     String(String),
     Logic(bool),
     Variable(String),
+    Binary {
+        left: Box<Value>,
+        op: BinaryOperator,
+        right: Box<Value>,
+    },
     Function {
         params: Vec<String>,
         body: Vec<Statement>,
@@ -30,6 +49,12 @@ pub enum Statement {
         object: String,
         name: String,
         body: Vec<Statement>,
+    },
+    If {
+        condition: Value,
+        then_branch: Vec<Statement>,
+        else_if_branches: Vec<(Value, Vec<Statement>)>,
+        else_branch: Option<Vec<Statement>>,
     },
 }
 
@@ -87,6 +112,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, String> {
         match self.peek() {
             Some(Token::Var) => self.parse_variable_decl(),
+            Some(Token::If) => self.parse_if_statement(),
             Some(Token::Identifier(_)) => {
                 let name = self.consume_identifier()?;
 
@@ -123,6 +149,39 @@ impl Parser {
             Some(Token::Eof) => Err("Unexpected end of file".to_string()),
             _ => Err(format!("Unexpected statement start: {:?}", self.peek())),
         }
+    }
+
+    fn parse_if_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::If)?;
+        self.expect(Token::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect(Token::RParen)?;
+        self.expect(Token::LBrace)?;
+        let then_branch = self.parse_block_contents()?;
+        let mut else_if_branches = Vec::new();
+
+        while self.match_token(Token::ElseIf) {
+            self.expect(Token::LParen)?;
+            let branch_condition = self.parse_expression()?;
+            self.expect(Token::RParen)?;
+            self.expect(Token::LBrace)?;
+            let branch_body = self.parse_block_contents()?;
+            else_if_branches.push((branch_condition, branch_body));
+        }
+
+        let else_branch = if self.match_token(Token::Else) {
+            self.expect(Token::LBrace)?;
+            Some(self.parse_block_contents()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::If {
+            condition,
+            then_branch,
+            else_if_branches,
+            else_branch,
+        })
     }
 
     fn parse_variable_decl(&mut self) -> Result<Statement, String> {
@@ -191,6 +250,80 @@ impl Parser {
     }
 
     fn parse_value(&mut self) -> Result<Value, String> {
+        self.parse_expression()
+    }
+
+    fn parse_expression(&mut self) -> Result<Value, String> {
+        self.parse_comparison()
+    }
+
+    fn parse_comparison(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_additive()?;
+        while matches!(
+            self.peek(),
+            Some(Token::Equal)
+                | Some(Token::NotEqual)
+                | Some(Token::GreaterThan)
+                | Some(Token::LessThan)
+                | Some(Token::GreaterEqual)
+                | Some(Token::LessEqual)
+        ) {
+            let op = self.parse_comparison_operator()?;
+            let right = self.parse_additive()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_additive(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_multiplicative()?;
+        while matches!(self.peek(), Some(Token::Plus) | Some(Token::Minus)) {
+            let op = if self.matches(Token::Plus) {
+                self.index += 1;
+                BinaryOperator::Add
+            } else if self.matches(Token::Minus) {
+                self.index += 1;
+                BinaryOperator::Subtract
+            } else {
+                return Err(format!("Expected operator, found {:?}", self.peek()));
+            };
+            let right = self.parse_multiplicative()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_multiplicative(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_primary()?;
+        while matches!(self.peek(), Some(Token::Asterisk) | Some(Token::Slash)) {
+            let op = if self.matches(Token::Asterisk) {
+                self.index += 1;
+                BinaryOperator::Multiply
+            } else if self.matches(Token::Slash) {
+                self.index += 1;
+                BinaryOperator::Divide
+            } else {
+                return Err(format!("Expected operator, found {:?}", self.peek()));
+            };
+            let right = self.parse_primary()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_primary(&mut self) -> Result<Value, String> {
         match self.peek() {
             Some(Token::StringLiteral(value)) => {
                 let value = value.clone();
@@ -216,7 +349,43 @@ impl Parser {
                 self.index += 1;
                 Ok(Value::Variable(name))
             }
+            Some(Token::LParen) => {
+                self.index += 1;
+                let value = self.parse_expression()?;
+                self.expect(Token::RParen)?;
+                Ok(value)
+            }
             _ => Err(format!("Expected value, found {:?}", self.peek())),
+        }
+    }
+
+    fn parse_comparison_operator(&mut self) -> Result<BinaryOperator, String> {
+        match self.peek() {
+            Some(Token::Equal) => {
+                self.index += 1;
+                Ok(BinaryOperator::Equal)
+            }
+            Some(Token::NotEqual) => {
+                self.index += 1;
+                Ok(BinaryOperator::NotEqual)
+            }
+            Some(Token::GreaterThan) => {
+                self.index += 1;
+                Ok(BinaryOperator::Greater)
+            }
+            Some(Token::LessThan) => {
+                self.index += 1;
+                Ok(BinaryOperator::Less)
+            }
+            Some(Token::GreaterEqual) => {
+                self.index += 1;
+                Ok(BinaryOperator::GreaterEqual)
+            }
+            Some(Token::LessEqual) => {
+                self.index += 1;
+                Ok(BinaryOperator::LessEqual)
+            }
+            _ => Err(format!("Expected comparison operator, found {:?}", self.peek())),
         }
     }
 
@@ -384,6 +553,36 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
                 }
             }
         }
+        Statement::If {
+            condition,
+            then_branch,
+            else_if_branches,
+            else_branch,
+        } => {
+            let condition_value = resolve_value(condition, environment)?;
+            if is_truthy(&condition_value) {
+                for stmt in then_branch {
+                    execute_statement(stmt, environment)?;
+                }
+                return Ok(());
+            }
+
+            for (else_if_condition, else_if_body) in else_if_branches {
+                let branch_value = resolve_value(else_if_condition, environment)?;
+                if is_truthy(&branch_value) {
+                    for stmt in else_if_body {
+                        execute_statement(stmt, environment)?;
+                    }
+                    return Ok(());
+                }
+            }
+
+            if let Some(else_body) = else_branch {
+                for stmt in else_body {
+                    execute_statement(stmt, environment)?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -395,7 +594,68 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             .get(name)
             .cloned()
             .ok_or_else(|| format!("Unknown variable: {}", name)),
+        Value::Binary { left, op, right } => {
+            let left_value = resolve_value(left, environment)?;
+            let right_value = resolve_value(right, environment)?;
+            evaluate_binary(left_value, right_value, op)
+        }
         _ => Ok(value.clone()),
+    }
+}
+
+fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, String> {
+    match op {
+        BinaryOperator::Add => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
+            (Value::String(a), Value::Number(b)) => Ok(Value::String(format!("{}{}", a, b))),
+            (Value::Number(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
+            _ => Err("Addition requires numbers or strings".to_string()),
+        },
+        BinaryOperator::Subtract => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
+            _ => Err("Subtraction requires numbers".to_string()),
+        },
+        BinaryOperator::Multiply => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
+            _ => Err("Multiplication requires numbers".to_string()),
+        },
+        BinaryOperator::Divide => match (left, right) {
+            (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
+            _ => Err("Division requires non-zero numbers".to_string()),
+        },
+        BinaryOperator::Equal => Ok(Value::Logic(left == right)),
+        BinaryOperator::NotEqual => Ok(Value::Logic(left != right)),
+        BinaryOperator::Greater => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a > b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(a > b)),
+            _ => Err("Greater-than requires comparable values".to_string()),
+        },
+        BinaryOperator::Less => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a < b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(a < b)),
+            _ => Err("Less-than requires comparable values".to_string()),
+        },
+        BinaryOperator::GreaterEqual => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a >= b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(a >= b)),
+            _ => Err("Greater-or-equal requires comparable values".to_string()),
+        },
+        BinaryOperator::LessEqual => match (left, right) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a <= b)),
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(a <= b)),
+            _ => Err("Less-or-equal requires comparable values".to_string()),
+        },
+    }
+}
+
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Logic(value) => *value,
+        Value::Number(value) => *value != 0.0,
+        Value::String(value) => !value.is_empty(),
+        Value::Null => false,
+        _ => true,
     }
 }
 
@@ -406,6 +666,7 @@ fn format_value(value: Value) -> String {
         Value::String(v) => v,
         Value::Logic(v) => v.to_string(),
         Value::Variable(v) => v,
+        Value::Binary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
     }
 }
@@ -447,6 +708,27 @@ mod tests {
         assert!(matches!(
             &program.statements[0],
             Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+    }
+
+    #[test]
+    fn parses_math_and_if_else_if_else_blocks() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local score number = 7\n    var local active logic = true\n    if (score > 5) {\n        con.Print(\"big\")\n    } elseif (active == true) {\n        con.Print(\"active\")\n    } else {\n        con.Print(\"small\")\n    }\n}\n";
+
+        let program = Parser::parse(source).unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+
+        let if_stmt = match &program.statements[0] {
+            Statement::Event { body, .. } => body.iter().find(|stmt| matches!(stmt, Statement::If { .. })).unwrap(),
+            _ => panic!("expected event body"),
+        };
+
+        assert!(matches!(
+            if_stmt,
+            Statement::If { else_if_branches, .. } if !else_if_branches.is_empty()
         ));
     }
 }

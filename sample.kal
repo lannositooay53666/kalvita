@@ -4,12 +4,78 @@ kal.OnStart {
     var local count number = 7
     var local enabled logic = true
     var local empty null = null
+    var local mode string = "demo"
+    var local version string = "v1 prototype"
+    var local score number = 10
+    var local bonus number = 3
 
+    con.Print("====================================================")
+    con.Print("Kalvita bootstrap test script")
+    con.Print("====================================================")
     con.Print(greeting)
     con.Print("count = ", count)
     con.Print("enabled = ", enabled)
     con.Print("null check = ", empty)
+    con.Print("mode = ", mode)
+    con.Print("version = ", version)
+    con.Print("math = ", score + bonus)
+    con.Print("subtract = ", score - bonus)
+    con.Print("multiply = ", score * bonus)
+    con.Print("divide = ", score / bonus)
+
+    var local sayHi function = (name) {
+        con.Print("Hi, ", name, "! Welcome to Kalvita.")
+    }
+
+    var local add function = (a, b) {
+        con.Print("sum inputs = ", a, b)
+    }
+
+    var local greetAndCount function = (name, numberValue) {
+        con.Print("Name: ", name)
+        con.Print("Number: ", numberValue)
+        con.Print("Status: ", "ready")
+    }
+
+    con.Print("----------------------------------------------------")
+    con.Print("Function demos")
+    con.Print("----------------------------------------------------")
+    sayHi("Nova")
+    add(10, 32)
+    greetAndCount("Kael", 99)
 
     var local tagged string = "prototype"
+    var local state string = "running"
+    var local ready logic = true
+
+    if (score > 5) {
+        con.Print("score is greater than 5")
+    } elseif (score == 10) {
+        con.Print("score is exactly 10")
+    } else {
+        con.Print("score is not greater than 5")
+    }
+
+    if (ready == true) {
+        con.Print("system ready")
+    } elseif (state == "paused") {
+        con.Print("system paused")
+    } else {
+        con.Print("system uncertain")
+    }
+
     con.Print("status: ", tagged)
+    con.Print("state: ", state)
+    con.Print("ready: ", ready)
+
+    var local finalMessage function = () {
+        con.Print("All prototype systems are online.")
+        con.Print("The interpreter can store functions as variables.")
+        con.Print("This makes Kalvita feel more like a real scripting language.")
+    }
+
+    finalMessage()
+    con.Print("====================================================")
+    con.Print("end of sample script")
+    con.Print("====================================================")
 }
