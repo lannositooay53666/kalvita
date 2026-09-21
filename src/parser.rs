@@ -596,9 +596,14 @@ fn invoke_function(
         _ => {
             let callee = if object.is_some() {
                 let obj = object.unwrap();
-                resolve_value(&Value::Variable(obj.to_string()), environment)?
+                resolve_value(&Value::Variable(obj.to_string()), environment)
+                    .or_else(|_| environment.get(&format!("var.{}", obj)).map(|v| Ok(v.clone())).unwrap_or_else(|| Err(format!("Unknown variable: {}", obj))))?
             } else {
-                resolve_value(&Value::Variable(function.to_string()), environment)?
+                resolve_value(&Value::Variable(function.to_string()), environment)
+                    .or_else(|_| {
+                        let prefixed = format!("var.{}", function);
+                        environment.get(&prefixed).map(|v| Ok(v.clone())).unwrap_or_else(|| Err(format!("Unknown variable: {}", function)))
+                    })?
             };
 
             match callee {
@@ -607,8 +612,7 @@ fn invoke_function(
                     for (param, arg) in params.iter().zip(args.iter()) {
                         let value = resolve_value(arg, environment)?;
                         let scoped = format!("arg.{}", param);
-                        local_env.insert(scoped.clone(), value.clone());
-                        local_env.insert(param.clone(), value);
+                        local_env.insert(scoped, value);
                     }
 
                     let mut result = None;
@@ -636,8 +640,7 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
                 Value::Function { .. } => value.clone(),
                 _ => resolve_value(value, environment)?,
             };
-            environment.insert(format!("var.{}", name), resolved.clone());
-            environment.insert(name.clone(), resolved);
+            environment.insert(format!("var.{}", name), resolved);
         }
         Statement::FunctionCall { object, function, args } => {
             let _ = invoke_function(object.as_deref(), function, args, environment)?;
@@ -688,19 +691,8 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
 }
 
 fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Option<Value> {
-    if let Some(value) = environment.get(name) {
-        return Some(value.clone());
-    }
-
-    let scoped_options = [
-        format!("var.{}", name),
-        format!("arg.{}", name),
-    ];
-
-    for scoped in scoped_options {
-        if let Some(value) = environment.get(&scoped) {
-            return Some(value.clone());
-        }
+    if name.starts_with("var.") || name.starts_with("arg.") {
+        return environment.get(name).cloned();
     }
 
     None
@@ -957,21 +949,21 @@ mod tests {
         execute_statement(&first, &mut environment).unwrap();
         execute_statement(&second, &mut environment).unwrap();
 
-        assert_eq!(environment.get("score"), Some(&Value::Number(15.0)));
+        assert_eq!(environment.get("var.score"), Some(&Value::Number(15.0)));
     }
 
     #[test]
     fn function_call_used_as_value_returns_result() {
         let mut environment = HashMap::new();
         environment.insert(
-            "add".to_string(),
+            "var.add".to_string(),
             Value::Function {
                 params: vec!["a".to_string(), "b".to_string()],
                 body: vec![Statement::Return {
                     value: Box::new(Value::Binary {
-                        left: Box::new(Value::Variable("a".to_string())),
+                        left: Box::new(Value::Variable("arg.a".to_string())),
                         op: BinaryOperator::Add,
-                        right: Box::new(Value::Variable("b".to_string())),
+                        right: Box::new(Value::Variable("arg.b".to_string())),
                     }),
                 }],
             },
@@ -1009,6 +1001,15 @@ mod tests {
         assert_eq!(resolved, Value::Number(15.0));
         let arg_a = resolve_value(&Value::Variable("arg.a".to_string()), &environment).unwrap();
         assert_eq!(arg_a, Value::Number(7.0));
+    }
+
+    #[test]
+    fn naked_variables_are_rejected() {
+        let mut environment = HashMap::new();
+        environment.insert("var.score".to_string(), Value::Number(15.0));
+
+        let result = resolve_value(&Value::Variable("score".to_string()), &environment);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1062,14 +1063,14 @@ mod tests {
     #[test]
     fn array_indexing_and_comparison_work() {
         let mut environment = HashMap::new();
-        environment.insert("items".to_string(), Value::Array(vec![
+        environment.insert("var.items".to_string(), Value::Array(vec![
             Value::String("apple".to_string()),
             Value::String("banana".to_string()),
             Value::String("orange".to_string()),
         ]));
 
         let first = resolve_value(&Value::Index {
-            target: Box::new(Value::Variable("items".to_string())),
+            target: Box::new(Value::Variable("var.items".to_string())),
             index: Box::new(Value::Number(0.0)),
         }, &environment).unwrap();
         assert_eq!(first, Value::String("apple".to_string()));

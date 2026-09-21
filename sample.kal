@@ -28,29 +28,29 @@ kal.OnStart {
     con.Print("after redeclare score = ", var.score)
 
     // Array reading and scalar math
-    con.Print("fruits = ", fruits)
-    con.Print("nums = ", nums)
-    con.Print("fruits[0] = ", fruits[0])
-    con.Print("nums + 10 = ", nums + 10)
-    con.Print("nums * 2 = ", nums * 2)
-    con.Print("combo + offsets = ", combo + offsets)
-    con.Print("repeatLeft + repeatRight = ", repeatLeft + repeatRight)
+    con.Print("fruits = ", var.fruits)
+    con.Print("nums = ", var.nums)
+    con.Print("fruits[0] = ", var.fruits[0])
+    con.Print("nums + 10 = ", var.nums + 10)
+    con.Print("nums * 2 = ", var.nums * 2)
+    con.Print("combo + offsets = ", var.combo + var.offsets)
+    con.Print("repeatLeft + repeatRight = ", var.repeatLeft + var.repeatRight)
 
     // String and arithmetic output
-    con.Print(hello)
-    con.Print("count = ", count)
-    con.Print("enabled = ", enabled)
-    con.Print("empty = ", empty)
-    con.Print("mode = ", mode)
-    con.Print("version = ", version)
-    con.Print("score + bonus = ", score + bonus)
-    con.Print("score - bonus = ", score - bonus)
-    con.Print("score * bonus = ", score * bonus)
-    con.Print("score / bonus = ", score / bonus)
+    con.Print(var.hello)
+    con.Print("count = ", var.count)
+    con.Print("enabled = ", var.enabled)
+    con.Print("empty = ", var.empty)
+    con.Print("mode = ", var.mode)
+    con.Print("version = ", var.version)
+    con.Print("score + bonus = ", var.score + var.bonus)
+    con.Print("score - bonus = ", var.score - var.bonus)
+    con.Print("score * bonus = ", var.score * var.bonus)
+    con.Print("score / bonus = ", var.score / var.bonus)
 
     // Function-as-variable style
     var local sayHi function = (name) {
-        con.Print("Hi, ", name, "! Welcome to Kalvita.")
+        con.Print("Hi, ", arg.name, "! Welcome to Kalvita.")
     }
 
     var local add function = (a, b) {
@@ -77,9 +77,9 @@ kal.OnStart {
         con.Print("score is not greater than 5")
     }
 
-    if (ready == true) {
+    if (var.ready == true) {
         con.Print("system ready")
-    } elseif (state == "paused") {
+    } elseif (var.state == "paused") {
         con.Print("system paused")
     } else {
         con.Print("system uncertain")
@@ -95,8 +95,8 @@ kal.OnStart {
 
     // Namespace-prefixed access
     con.Print("var.score = ", var.score)
-    con.Print("state = ", state)
-    con.Print("ready = ", ready)
+    con.Print("state = ", var.state)
+    con.Print("ready = ", var.ready)
 
     // More examples for function variables
     var local finalMessage function = () {
