@@ -1,111 +1,41 @@
 [SCRIPTTYPE KALVITA VERSION 1]
 kal.OnStart {
-    // Basic variables and constants
-    var local hello string = "Hello from Kalvita"
-    var local count number = 7
-    var local enabled logic = true
-    var local empty null = null
-    var local mode string = "demo"
-    var local version string = "v1 prototype"
-    var local score number = 10
-    var local bonus number = 3
-
-    // Arrays and list values
-    var local fruits array = ["apple", "banana", "orange", "pear"]
-    var local nums array = [12, 64, 9, 747]
-    var local combo array = [12, 53, 5, 23]
-    var local offsets array = [10, 32, 6, 3]
-    var local repeatLeft array = [12, 42, 6, 2]
-    var local repeatRight array = [11, 6]
-
-    // Multi-line block comments are ignored by the lexer
-    .// These lines are skipped
-    This text is not tokenized //.
-
-    // Redeclaration updates the existing variable value
-    con.Print("before redeclare score = ", var.score)
-    var local score number = 15
-    con.Print("after redeclare score = ", var.score)
-
-    // Array reading and scalar math
-    con.Print("fruits = ", var.fruits)
-    con.Print("nums = ", var.nums)
-    con.Print("fruits[0] = ", var.fruits[0])
-    con.Print("nums + 10 = ", var.nums + 10)
-    con.Print("nums * 2 = ", var.nums * 2)
-    con.Print("combo + offsets = ", var.combo + var.offsets)
-    con.Print("repeatLeft + repeatRight = ", var.repeatLeft + var.repeatRight)
-
-    // String and arithmetic output
-    con.Print(var.hello)
-    con.Print("count = ", var.count)
-    con.Print("enabled = ", var.enabled)
-    con.Print("empty = ", var.empty)
-    con.Print("mode = ", var.mode)
-    con.Print("version = ", var.version)
-    con.Print("score + bonus = ", var.score + var.bonus)
-    con.Print("score - bonus = ", var.score - var.bonus)
-    con.Print("score * bonus = ", var.score * var.bonus)
-    con.Print("score / bonus = ", var.score / var.bonus)
-
-    // Function-as-variable style
-    var local sayHi function = (name) {
-        con.Print("Hi, ", arg.name, "! Welcome to Kalvita.")
-    }
+    var local score number = 7
+    var local args array = ["The score is ", var.score]
+    var local enemy object = { health: 40, damage: 5, speed: 10 }
 
     var local add function = (a, b) {
-        con.Print("Adding ", arg.a, " and ", arg.b)
+        con.Print("arg bundle = ", arg)
+        con.Print("arg.a = ", arg.a)
+        con.Print("arg.b = ", arg.b)
         return(arg.a + arg.b)
     }
 
-    var local greetAndCount function = (name, numberValue) {
-        con.Print("Name: ", arg.name)
-        con.Print("Number: ", arg.numberValue)
-        con.Print("Status: ", "ready")
+    var local readEnemy function = () {
+        con.Print("enemy health = ", var.enemy.health)
+        con.Print("enemy damage = ", var.enemy.damage)
+        return(var.enemy.health + var.enemy.damage)
     }
 
-    // Conditional blocks
-    var local tagged string = "prototype"
-    var local state string = "running"
-    var local ready logic = true
+    con.Print("args = ", var.args)
+    con.Print("sum = ", add(15 + 2, 5))
+    con.Print("enemy total = ", readEnemy())
+
+    con.Print("sin(0) = ", math.Sin(0))
+    con.Print("cos(0) = ", math.Cos(0))
+    con.Print("tan(0) = ", math.Tan(0))
 
     if (var.score > 5) {
         con.Print("score is greater than 5")
-    } elseif (var.score == 10) {
-        con.Print("score is exactly 10")
     } else {
         con.Print("score is not greater than 5")
     }
 
-    if (var.ready == true) {
-        con.Print("system ready")
-    } elseif (var.state == "paused") {
-        con.Print("system paused")
-    } else {
-        con.Print("system uncertain")
+    if (true and true) {
+        con.Print("logic gates work")
     }
 
-    // Function calls and return values
-    con.Print("----------------------------------------------------")
-    con.Print("Function demos")
-    con.Print("----------------------------------------------------")
-    sayHi("Nova")
-    con.Print("sum = ", add(15 + 2, 5))
-    greetAndCount("Kael", 99)
-
-    // Namespace-prefixed access
-    con.Print("var.score = ", var.score)
-    con.Print("state = ", var.state)
-    con.Print("ready = ", var.ready)
-
-    // More examples for function variables
-    var local finalMessage function = () {
-        con.Print("All prototype systems are online.")
-        con.Print("The interpreter can store functions as variables.")
-        con.Print("This makes Kalvita feel more like a real scripting language.")
+    if (not false) {
+        con.Print("not operator works")
     }
-
-    finalMessage()
-
-    con.Print("====================================================")
 }

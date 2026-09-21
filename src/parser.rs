@@ -434,22 +434,31 @@ impl Parser {
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.index += 1;
-                if self.matches(Token::LParen) {
-                    let args = self.parse_arguments()?;
-                    Value::FunctionCall {
-                        object: None,
-                        function: name,
-                        args,
-                    }
-                } else if self.matches(Token::Dot) {
+                if self.matches(Token::Dot) {
                     self.expect(Token::Dot)?;
                     let scoped_name = self.consume_identifier()?;
+                    if self.matches(Token::LParen) {
+                        let args = self.parse_arguments()?;
+                        return Ok(Value::FunctionCall {
+                            object: Some(name),
+                            function: scoped_name,
+                            args,
+                        });
+                    }
+
                     if name == "arg" {
                         Value::Variable(format!("arg.{}", scoped_name))
                     } else if name == "var" {
                         Value::Variable(format!("var.{}", scoped_name))
                     } else {
                         Value::Variable(format!("{}.", name))
+                    }
+                } else if self.matches(Token::LParen) {
+                    let args = self.parse_arguments()?;
+                    Value::FunctionCall {
+                        object: None,
+                        function: name,
+                        args,
                     }
                 } else {
                     Value::Variable(name)
@@ -733,7 +742,14 @@ fn invoke_function(
             match callee {
                 Value::Function { params, body } => {
                     let mut local_env = environment.clone();
+                    let argument_array = Value::Array(
+                        args.iter()
+                            .map(|arg| resolve_value(arg, environment))
+                            .collect::<Result<Vec<_>, String>>()?,
+                    );
                     local_env.insert("pass".to_string(), passed_value);
+                    local_env.insert("arg".to_string(), argument_array.clone());
+                    local_env.insert("args".to_string(), argument_array);
                     for (param, arg) in params.iter().zip(args.iter()) {
                         let value = resolve_value(arg, environment)?;
                         let scoped = format!("arg.{}", param);
@@ -820,6 +836,10 @@ fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Op
         return environment.get("pass").cloned();
     }
 
+    if name == "arg" || name == "args" {
+        return environment.get(name).cloned();
+    }
+
     if name.starts_with("var.") || name.starts_with("arg.") {
         return environment.get(name).cloned();
     }
@@ -837,6 +857,19 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
                 Some(value) => Ok(value),
                 None => Ok(Value::Null),
             }
+        }
+        Value::Array(items) => Ok(Value::Array(
+            items
+                .iter()
+                .map(|item| resolve_value(item, environment))
+                .collect::<Result<Vec<_>, String>>()?,
+        )),
+        Value::Object(map) => {
+            let mut resolved = HashMap::new();
+            for (key, item) in map {
+                resolved.insert(key.clone(), resolve_value(item, environment)?);
+            }
+            Ok(Value::Object(resolved))
         }
         Value::Property { target, key } => {
             let target_value = resolve_value(target, environment)?;
@@ -1262,6 +1295,63 @@ mod tests {
 
         let null_result = invoke_function(None, "attack", &[], &environment).unwrap().unwrap();
         assert_eq!(null_result, Value::Null);
+    }
+
+    #[test]
+    fn namespaced_function_calls_parse_as_method_calls() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local enemy object = { health: 40, damage: 5 }\n    con.Print(math.Sin(0))\n    enemy.attack()\n}\n";
+
+        let program = Parser::parse(source).unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+    }
+
+    #[test]
+    fn function_arguments_are_stored_as_array() {
+        let mut environment = HashMap::new();
+        environment.insert("var.score".to_string(), Value::Number(42.0));
+        environment.insert(
+            "var.doSomething".to_string(),
+            Value::Function {
+                params: vec!["a".to_string()],
+                body: vec![Statement::Return {
+                    value: Box::new(Value::Variable("arg".to_string())),
+                }],
+            },
+        );
+
+        let result = resolve_value(
+            &Value::FunctionCall {
+                object: None,
+                function: "doSomething".to_string(),
+                args: vec![
+                    Value::String("arg1".to_string()),
+                    Value::Variable("var.score".to_string()),
+                    Value::Number(3.0),
+                    Value::Array(vec![
+                        Value::String("you can".to_string()),
+                        Value::String("also have".to_string()),
+                    ]),
+                ],
+            },
+            &environment,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::String("arg1".to_string()),
+                Value::Number(42.0),
+                Value::Number(3.0),
+                Value::Array(vec![
+                    Value::String("you can".to_string()),
+                    Value::String("also have".to_string()),
+                ]),
+            ])
+        );
     }
 
     #[test]
