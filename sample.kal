@@ -1,5 +1,15 @@
 [SCRIPTTYPE KALVITA VERSION 1]
 kal.OnStart {
-    var local wow string = "Hello world"
-    con.Print(wow)
+    var local greeting string = "Hello from Kalvita"
+    var local count number = 7
+    var local enabled logic = true
+    var local empty null = null
+
+    con.Print(greeting)
+    con.Print("count = ", count)
+    con.Print("enabled = ", enabled)
+    con.Print("null check = ", empty)
+
+    var local tagged string = "prototype"
+    con.Print("status: ", tagged)
 }

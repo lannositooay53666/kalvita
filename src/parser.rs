@@ -193,6 +193,10 @@ impl Parser {
                 self.index += 1;
                 Ok("logic".to_string())
             }
+            Some(Token::Null) => {
+                self.index += 1;
+                Ok("null".to_string())
+            }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.index += 1;
@@ -335,6 +339,17 @@ mod tests {
         assert_eq!(program.header.version, 1);
         assert_eq!(program.header.script_type, "SCRIPTTYPE");
         assert_eq!(program.header.language, "KALVITA");
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+    }
+
+    #[test]
+    fn parses_null_variable_and_literal() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local empty null = null\n    con.Print(empty)\n}\n";
+
+        let program = Parser::parse(source).unwrap();
         assert!(matches!(
             &program.statements[0],
             Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
