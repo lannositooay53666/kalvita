@@ -27,6 +27,11 @@ pub enum Value {
         target: Box<Value>,
         index: Box<Value>,
     },
+    FunctionCall {
+        object: Option<String>,
+        function: String,
+        args: Vec<Value>,
+    },
     Binary {
         left: Box<Value>,
         op: BinaryOperator,
@@ -49,6 +54,9 @@ pub enum Statement {
         object: Option<String>,
         function: String,
         args: Vec<Value>,
+    },
+    Return {
+        value: Box<Value>,
     },
     Event {
         object: String,
@@ -117,6 +125,7 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Statement, String> {
         match self.peek() {
             Some(Token::Var) => self.parse_variable_decl(),
+            Some(Token::Return) => self.parse_return_statement(),
             Some(Token::If) => self.parse_if_statement(),
             Some(Token::Identifier(_)) => {
                 let name = self.consume_identifier()?;
@@ -154,6 +163,16 @@ impl Parser {
             Some(Token::Eof) => Err("Unexpected end of file".to_string()),
             _ => Err(format!("Unexpected statement start: {:?}", self.peek())),
         }
+    }
+
+    fn parse_return_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Return)?;
+        self.expect(Token::LParen)?;
+        let value = self.parse_value()?;
+        self.expect(Token::RParen)?;
+        Ok(Statement::Return {
+            value: Box::new(value),
+        })
     }
 
     fn parse_if_statement(&mut self) -> Result<Statement, String> {
@@ -352,7 +371,16 @@ impl Parser {
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.index += 1;
-                Value::Variable(name)
+                if self.matches(Token::LParen) {
+                    let args = self.parse_arguments()?;
+                    Value::FunctionCall {
+                        object: None,
+                        function: name,
+                        args,
+                    }
+                } else {
+                    Value::Variable(name)
+                }
             }
             Some(Token::LBracket) => self.parse_array_literal()?,
             Some(Token::LParen) => {
@@ -533,6 +561,56 @@ pub fn execute(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
+fn invoke_function(
+    object: Option<&str>,
+    function: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+) -> Result<Option<Value>, String> {
+    match object {
+        Some(obj) if obj == "con" && function == "Print" => {
+            let mut rendered = Vec::new();
+            for arg in args {
+                let value = resolve_value(arg, environment)?;
+                rendered.push(format_value(value));
+            }
+            println!("{}", rendered.join(" "));
+            Ok(None)
+        }
+        _ => {
+            let callee = if object.is_some() {
+                let obj = object.unwrap();
+                resolve_value(&Value::Variable(obj.to_string()), environment)?
+            } else {
+                resolve_value(&Value::Variable(function.to_string()), environment)?
+            };
+
+            match callee {
+                Value::Function { params, body } => {
+                    let mut local_env = environment.clone();
+                    for (param, arg) in params.iter().zip(args.iter()) {
+                        let value = resolve_value(arg, environment)?;
+                        local_env.insert(param.clone(), value);
+                    }
+
+                    let mut result = None;
+                    for stmt in body {
+                        match stmt {
+                            Statement::Return { value } => {
+                                result = Some(resolve_value(&value, &local_env)?);
+                                break;
+                            }
+                            _ => execute_statement(&stmt, &mut local_env)?,
+                        }
+                    }
+                    Ok(result)
+                }
+                _ => Err(format!("{} is not callable", function)),
+            }
+        }
+    }
+}
+
 fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Value>) -> Result<(), String> {
     match statement {
         Statement::VariableDecl { name, value, .. } => {
@@ -543,48 +621,10 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
             environment.insert(name.clone(), resolved);
         }
         Statement::FunctionCall { object, function, args } => {
-            match object {
-                Some(obj) if obj == "con" && function == "Print" => {
-                    let mut rendered = Vec::new();
-                    for arg in args {
-                        let value = resolve_value(arg, environment)?;
-                        rendered.push(format_value(value));
-                    }
-                    println!("{}", rendered.join(" "));
-                }
-                Some(_) => {
-                    let callee = resolve_value(&Value::Variable(function.clone()), environment)?;
-                    match callee {
-                        Value::Function { params, body } => {
-                            let mut local_env = environment.clone();
-                            for (param, arg) in params.iter().zip(args.iter()) {
-                                let value = resolve_value(arg, environment)?;
-                                local_env.insert(param.clone(), value);
-                            }
-                            for stmt in body {
-                                execute_statement(&stmt, &mut local_env)?;
-                            }
-                        }
-                        _ => return Err(format!("{} is not callable", function)),
-                    }
-                }
-                None => {
-                    let callee = resolve_value(&Value::Variable(function.clone()), environment)?;
-                    match callee {
-                        Value::Function { params, body } => {
-                            let mut local_env = environment.clone();
-                            for (param, arg) in params.iter().zip(args.iter()) {
-                                let value = resolve_value(arg, environment)?;
-                                local_env.insert(param.clone(), value);
-                            }
-                            for stmt in body {
-                                execute_statement(&stmt, &mut local_env)?;
-                            }
-                        }
-                        _ => return Err(format!("{} is not callable", function)),
-                    }
-                }
-            }
+            let _ = invoke_function(object.as_deref(), function, args, environment)?;
+        }
+        Statement::Return { value } => {
+            return Err("return can only be used inside a function body".to_string());
         }
         Statement::Event { object, name, body } => {
             if object == "kal" && name == "OnStart" {
@@ -634,6 +674,13 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             .get(name)
             .cloned()
             .ok_or_else(|| format!("Unknown variable: {}", name)),
+        Value::FunctionCall { object, function, args } => {
+            let result = invoke_function(object.as_deref(), function, args, environment)?;
+            match result {
+                Some(value) => Ok(value),
+                None => Ok(Value::Null),
+            }
+        }
         Value::Index { target, index } => {
             let target_value = resolve_value(target, environment)?;
             let index_value = resolve_value(index, environment)?;
@@ -788,6 +835,7 @@ fn format_value(value: Value) -> String {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
         }
+        Value::FunctionCall { .. } => "<function-call>".to_string(),
         Value::Index { .. } => "<index>".to_string(),
         Value::Binary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
@@ -874,6 +922,36 @@ mod tests {
         execute_statement(&second, &mut environment).unwrap();
 
         assert_eq!(environment.get("score"), Some(&Value::Number(15.0)));
+    }
+
+    #[test]
+    fn function_call_used_as_value_returns_result() {
+        let mut environment = HashMap::new();
+        environment.insert(
+            "add".to_string(),
+            Value::Function {
+                params: vec!["a".to_string(), "b".to_string()],
+                body: vec![Statement::Return {
+                    value: Box::new(Value::Binary {
+                        left: Box::new(Value::Variable("a".to_string())),
+                        op: BinaryOperator::Add,
+                        right: Box::new(Value::Variable("b".to_string())),
+                    }),
+                }],
+            },
+        );
+
+        let result = resolve_value(
+            &Value::FunctionCall {
+                object: None,
+                function: "add".to_string(),
+                args: vec![Value::Number(15.0), Value::Number(2.0)],
+            },
+            &environment,
+        )
+        .unwrap();
+
+        assert_eq!(result, Value::Number(17.0));
     }
 
     #[test]
