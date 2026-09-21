@@ -23,6 +23,10 @@ pub enum Value {
     Logic(bool),
     Variable(String),
     Array(Vec<Value>),
+    Index {
+        target: Box<Value>,
+        index: Box<Value>,
+    },
     Binary {
         left: Box<Value>,
         op: BinaryOperator,
@@ -325,40 +329,52 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Value, String> {
-        match self.peek() {
+        let mut value = match self.peek() {
             Some(Token::StringLiteral(value)) => {
                 let value = value.clone();
                 self.index += 1;
-                Ok(Value::String(value))
+                Value::String(value)
             }
             Some(Token::NumberLiteral(value)) => {
                 let value = *value;
                 self.index += 1;
-                Ok(Value::Number(value))
+                Value::Number(value)
             }
             Some(Token::BoolLiteral(value)) => {
                 let value = *value;
                 self.index += 1;
-                Ok(Value::Logic(value))
+                Value::Logic(value)
             }
             Some(Token::Null) => {
                 self.index += 1;
-                Ok(Value::Null)
+                Value::Null
             }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.index += 1;
-                Ok(Value::Variable(name))
+                Value::Variable(name)
             }
-            Some(Token::LBracket) => self.parse_array_literal(),
+            Some(Token::LBracket) => self.parse_array_literal()?,
             Some(Token::LParen) => {
                 self.index += 1;
                 let value = self.parse_expression()?;
                 self.expect(Token::RParen)?;
-                Ok(value)
+                value
             }
-            _ => Err(format!("Expected value, found {:?}", self.peek())),
+            _ => return Err(format!("Expected value, found {:?}", self.peek())),
+        };
+
+        while matches!(self.peek(), Some(Token::LBracket)) {
+            self.expect(Token::LBracket)?;
+            let index = self.parse_expression()?;
+            self.expect(Token::RBracket)?;
+            value = Value::Index {
+                target: Box::new(value),
+                index: Box::new(index),
+            };
         }
+
+        Ok(value)
     }
 
     fn parse_array_literal(&mut self) -> Result<Value, String> {
@@ -618,6 +634,27 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             .get(name)
             .cloned()
             .ok_or_else(|| format!("Unknown variable: {}", name)),
+        Value::Index { target, index } => {
+            let target_value = resolve_value(target, environment)?;
+            let index_value = resolve_value(index, environment)?;
+            match (target_value, index_value) {
+                (Value::Array(items), Value::Number(index)) => {
+                    let idx = index as usize;
+                    items.get(idx)
+                        .cloned()
+                        .ok_or_else(|| format!("Index out of bounds: {}", idx))
+                }
+                (Value::String(value), Value::Number(index)) => {
+                    let idx = index as usize;
+                    let ch = value
+                        .chars()
+                        .nth(idx)
+                        .ok_or_else(|| format!("Index out of bounds: {}", idx))?;
+                    Ok(Value::String(ch.to_string()))
+                }
+                _ => Err("Index requires an array or string with a numeric index".to_string()),
+            }
+        }
         Value::Binary { left, op, right } => {
             let left_value = resolve_value(left, environment)?;
             let right_value = resolve_value(right, environment)?;
@@ -630,6 +667,7 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
 fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, String> {
     match op {
         BinaryOperator::Add => match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
@@ -639,18 +677,21 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
             _ => Err("Addition requires numbers or strings".to_string()),
         },
         BinaryOperator::Subtract => match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
             _ => Err("Subtraction requires numbers".to_string()),
         },
         BinaryOperator::Multiply => match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
             _ => Err("Multiplication requires numbers".to_string()),
         },
         BinaryOperator::Divide => match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
@@ -708,6 +749,24 @@ fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) 
     Ok(Value::Array(result))
 }
 
+fn apply_array_array_op(left_items: Vec<Value>, right_items: Vec<Value>, op: &BinaryOperator) -> Result<Value, String> {
+    let max_len = left_items.len().max(right_items.len());
+    let mut result = Vec::with_capacity(max_len);
+
+    for i in 0..max_len {
+        let left_value = left_items.get(i % left_items.len()).cloned().unwrap_or_else(|| Value::Number(0.0));
+        let right_value = right_items.get(i % right_items.len()).cloned().unwrap_or_else(|| Value::Number(0.0));
+
+        let next = match evaluate_binary(left_value, right_value, op)? {
+            Value::Number(value) => Value::Number(value),
+            other => other,
+        };
+        result.push(next);
+    }
+
+    Ok(Value::Array(result))
+}
+
 fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Logic(value) => *value,
@@ -729,6 +788,7 @@ fn format_value(value: Value) -> String {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
         }
+        Value::Index { .. } => "<index>".to_string(),
         Value::Binary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
     }
@@ -836,10 +896,54 @@ mod tests {
             ])
         );
 
+        let longer = Value::Array(vec![
+            Value::Number(12.0),
+            Value::Number(42.0),
+            Value::Number(6.0),
+            Value::Number(2.0),
+        ]);
+        let shorter = Value::Array(vec![
+            Value::Number(11.0),
+            Value::Number(6.0),
+        ]);
+        let repeated = evaluate_binary(longer, shorter, &BinaryOperator::Add).unwrap();
+        assert_eq!(
+            repeated,
+            Value::Array(vec![
+                Value::Number(23.0),
+                Value::Number(48.0),
+                Value::Number(17.0),
+                Value::Number(8.0),
+            ])
+        );
+
         let strings = Value::Array(vec![
             Value::String("apple".to_string()),
             Value::String("banana".to_string()),
         ]);
         assert!(evaluate_binary(strings, Value::Number(10.0), &BinaryOperator::Add).is_err());
+    }
+
+    #[test]
+    fn array_indexing_and_comparison_work() {
+        let mut environment = HashMap::new();
+        environment.insert("items".to_string(), Value::Array(vec![
+            Value::String("apple".to_string()),
+            Value::String("banana".to_string()),
+            Value::String("orange".to_string()),
+        ]));
+
+        let first = resolve_value(&Value::Index {
+            target: Box::new(Value::Variable("items".to_string())),
+            index: Box::new(Value::Number(0.0)),
+        }, &environment).unwrap();
+        assert_eq!(first, Value::String("apple".to_string()));
+
+        let compare = evaluate_binary(
+            Value::Number(15.0),
+            Value::Number(10.0),
+            &BinaryOperator::Greater,
+        ).unwrap();
+        assert_eq!(compare, Value::Logic(true));
     }
 }

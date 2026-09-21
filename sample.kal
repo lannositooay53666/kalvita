@@ -10,6 +10,10 @@ kal.OnStart {
     var local bonus number = 3
     var local items array = ["apple", "banana", "orange", "pear"]
     var local nums array = [12, 64, 9, 747]
+    var local combo array = [12, 53, 5, 23]
+    var local offsets array = [10, 32, 6, 3]
+    var local repeatArr array = [12, 42, 6, 2]
+    var local repeatOffset array = [11, 6]
 
     con.Print("====================================================")
     con.Print("Kalvita bootstrap test script")
@@ -19,8 +23,11 @@ kal.OnStart {
     con.Print("after redeclare score = ", score)
     con.Print("array items = ", items)
     con.Print("array nums = ", nums)
+    con.Print("items[0] = ", items[0])
     con.Print("nums + 10 = ", nums + 10)
     con.Print("nums * 2 = ", nums * 2)
+    con.Print("combo + offsets = ", combo + offsets)
+    con.Print("repeatArr + repeatOffset = ", repeatArr + repeatOffset)
     con.Print(greeting)
     con.Print("count = ", count)
     con.Print("enabled = ", enabled)
