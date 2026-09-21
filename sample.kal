@@ -8,10 +8,19 @@ kal.OnStart {
     var local version string = "v1 prototype"
     var local score number = 10
     var local bonus number = 3
+    var local items array = ["apple", "banana", "orange", "pear"]
+    var local nums array = [12, 64, 9, 747]
 
     con.Print("====================================================")
     con.Print("Kalvita bootstrap test script")
     con.Print("====================================================")
+    con.Print("before redeclare score = ", score)
+    var local score number = 15
+    con.Print("after redeclare score = ", score)
+    con.Print("array items = ", items)
+    con.Print("array nums = ", nums)
+    con.Print("nums + 10 = ", nums + 10)
+    con.Print("nums * 2 = ", nums * 2)
     con.Print(greeting)
     con.Print("count = ", count)
     con.Print("enabled = ", enabled)

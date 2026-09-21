@@ -30,6 +30,7 @@ pub enum Token {
     LBracket,
     RBracket,
     Comma,
+    ArrayType,
     Plus,
     Minus,
     Asterisk,
@@ -191,6 +192,7 @@ impl Lexer {
                         "string" => Token::StringType,
                         "number" => Token::NumberType,
                         "logic" => Token::LogicType,
+                        "array" => Token::ArrayType,
                         _ => Token::Identifier(ident),
                     };
                     tokens.push(token);

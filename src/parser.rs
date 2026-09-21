@@ -22,6 +22,7 @@ pub enum Value {
     String(String),
     Logic(bool),
     Variable(String),
+    Array(Vec<Value>),
     Binary {
         left: Box<Value>,
         op: BinaryOperator,
@@ -349,6 +350,7 @@ impl Parser {
                 self.index += 1;
                 Ok(Value::Variable(name))
             }
+            Some(Token::LBracket) => self.parse_array_literal(),
             Some(Token::LParen) => {
                 self.index += 1;
                 let value = self.parse_expression()?;
@@ -357,6 +359,24 @@ impl Parser {
             }
             _ => Err(format!("Expected value, found {:?}", self.peek())),
         }
+    }
+
+    fn parse_array_literal(&mut self) -> Result<Value, String> {
+        self.expect(Token::LBracket)?;
+        let mut items = Vec::new();
+
+        if !matches!(self.peek(), Some(Token::RBracket)) {
+            loop {
+                items.push(self.parse_value()?);
+                if self.match_token(Token::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+
+        self.expect(Token::RBracket)?;
+        Ok(Value::Array(items))
     }
 
     fn parse_comparison_operator(&mut self) -> Result<BinaryOperator, String> {
@@ -410,6 +430,10 @@ impl Parser {
             Some(Token::Function) => {
                 self.index += 1;
                 Ok("function".to_string())
+            }
+            Some(Token::ArrayType) => {
+                self.index += 1;
+                Ok("array".to_string())
             }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -606,6 +630,8 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
 fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, String> {
     match op {
         BinaryOperator::Add => match (left, right) {
+            (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+            (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a + b)),
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             (Value::String(a), Value::Number(b)) => Ok(Value::String(format!("{}{}", a, b))),
@@ -613,14 +639,20 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
             _ => Err("Addition requires numbers or strings".to_string()),
         },
         BinaryOperator::Subtract => match (left, right) {
+            (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+            (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
             _ => Err("Subtraction requires numbers".to_string()),
         },
         BinaryOperator::Multiply => match (left, right) {
+            (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+            (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
             _ => Err("Multiplication requires numbers".to_string()),
         },
         BinaryOperator::Divide => match (left, right) {
+            (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+            (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
             _ => Err("Division requires non-zero numbers".to_string()),
         },
@@ -649,6 +681,33 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
     }
 }
 
+fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) -> Result<Value, String> {
+    let scalar_number = match scalar {
+        Value::Number(value) => value,
+        _ => return Err(format!("Array math requires a numeric scalar, got {:?}", scalar)),
+    };
+
+    let mut result = Vec::new();
+    for item in items {
+        let current = match item {
+            Value::Number(value) => value,
+            _ => return Err("Array math only works on numeric arrays".to_string()),
+        };
+
+        let transformed = match op {
+            BinaryOperator::Add => current + scalar_number,
+            BinaryOperator::Subtract => current - scalar_number,
+            BinaryOperator::Multiply => current * scalar_number,
+            BinaryOperator::Divide if scalar_number != 0.0 => current / scalar_number,
+            BinaryOperator::Divide => return Err("Division by zero in array math".to_string()),
+            _ => return Err("Unsupported array operation".to_string()),
+        };
+        result.push(Value::Number(transformed));
+    }
+
+    Ok(Value::Array(result))
+}
+
 fn is_truthy(value: &Value) -> bool {
     match value {
         Value::Logic(value) => *value,
@@ -666,6 +725,10 @@ fn format_value(value: Value) -> String {
         Value::String(v) => v,
         Value::Logic(v) => v.to_string(),
         Value::Variable(v) => v,
+        Value::Array(items) => {
+            let rendered: Vec<String> = items.into_iter().map(format_value).collect();
+            format!("[{}]", rendered.join(", "))
+        }
         Value::Binary { .. } => "<expression>".to_string(),
         Value::Function { .. } => "<function>".to_string(),
     }
@@ -730,5 +793,53 @@ mod tests {
             if_stmt,
             Statement::If { else_if_branches, .. } if !else_if_branches.is_empty()
         ));
+    }
+
+    #[test]
+    fn redeclaring_variable_updates_value() {
+        let mut environment = HashMap::new();
+
+        let first = Statement::VariableDecl {
+            name: "score".to_string(),
+            type_name: "number".to_string(),
+            value: Value::Number(10.0),
+        };
+        let second = Statement::VariableDecl {
+            name: "score".to_string(),
+            type_name: "number".to_string(),
+            value: Value::Number(15.0),
+        };
+
+        execute_statement(&first, &mut environment).unwrap();
+        execute_statement(&second, &mut environment).unwrap();
+
+        assert_eq!(environment.get("score"), Some(&Value::Number(15.0)));
+    }
+
+    #[test]
+    fn array_numeric_math_broadcasts_and_string_arrays_error() {
+        let nums = Value::Array(vec![
+            Value::Number(12.0),
+            Value::Number(64.0),
+            Value::Number(9.0),
+            Value::Number(747.0),
+        ]);
+
+        let result = evaluate_binary(nums.clone(), Value::Number(10.0), &BinaryOperator::Add).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Number(22.0),
+                Value::Number(74.0),
+                Value::Number(19.0),
+                Value::Number(757.0),
+            ])
+        );
+
+        let strings = Value::Array(vec![
+            Value::String("apple".to_string()),
+            Value::String("banana".to_string()),
+        ]);
+        assert!(evaluate_binary(strings, Value::Number(10.0), &BinaryOperator::Add).is_err());
     }
 }
