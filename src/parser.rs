@@ -8,6 +8,10 @@ pub enum Value {
     String(String),
     Logic(bool),
     Variable(String),
+    Function {
+        params: Vec<String>,
+        body: Vec<Statement>,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -18,7 +22,7 @@ pub enum Statement {
         value: Value,
     },
     FunctionCall {
-        object: String,
+        object: Option<String>,
         function: String,
         args: Vec<Value>,
     },
@@ -84,25 +88,36 @@ impl Parser {
         match self.peek() {
             Some(Token::Var) => self.parse_variable_decl(),
             Some(Token::Identifier(_)) => {
-                let object = self.consume_identifier()?;
+                let name = self.consume_identifier()?;
+
                 if self.match_token(Token::Dot) {
                     let function = self.consume_identifier()?;
                     if matches!(self.peek(), Some(Token::LBrace)) {
                         self.expect(Token::LBrace)?;
                         let body = self.parse_block_contents()?;
                         return Ok(Statement::Event {
-                            object,
+                            object: name,
                             name: function,
                             body,
                         });
                     }
                     let args = self.parse_arguments()?;
                     return Ok(Statement::FunctionCall {
-                        object,
+                        object: Some(name),
                         function,
                         args,
                     });
                 }
+
+                if self.matches(Token::LParen) {
+                    let args = self.parse_arguments()?;
+                    return Ok(Statement::FunctionCall {
+                        object: None,
+                        function: name,
+                        args,
+                    });
+                }
+
                 Err(format!("Unexpected syntax after identifier: {:?}", self.peek()))
             }
             Some(Token::Eof) => Err("Unexpected end of file".to_string()),
@@ -116,12 +131,38 @@ impl Parser {
         let name = self.consume_identifier()?;
         let type_name = self.consume_type_name()?;
         self.expect(Token::Assign)?;
-        let value = self.parse_value()?;
+        let value = if self.matches(Token::LParen) {
+            self.parse_function_literal()?
+        } else {
+            self.parse_value()?
+        };
         Ok(Statement::VariableDecl {
             name,
             type_name,
             value,
         })
+    }
+
+    fn parse_function_literal(&mut self) -> Result<Value, String> {
+        self.expect(Token::LParen)?;
+        let params = self.parse_parameter_list()?;
+        self.expect(Token::RParen)?;
+        self.expect(Token::LBrace)?;
+        let body = self.parse_block_contents()?;
+        Ok(Value::Function { params, body })
+    }
+
+    fn parse_parameter_list(&mut self) -> Result<Vec<String>, String> {
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                params.push(self.consume_identifier()?);
+                if !self.match_token(Token::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(params)
     }
 
     fn parse_block_contents(&mut self) -> Result<Vec<Statement>, String> {
@@ -196,6 +237,10 @@ impl Parser {
             Some(Token::Null) => {
                 self.index += 1;
                 Ok("null".to_string())
+            }
+            Some(Token::Function) => {
+                self.index += 1;
+                Ok("function".to_string())
             }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -282,17 +327,54 @@ pub fn execute(program: &Program) -> Result<(), String> {
 fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Value>) -> Result<(), String> {
     match statement {
         Statement::VariableDecl { name, value, .. } => {
-            let resolved = resolve_value(value, environment)?;
+            let resolved = match value {
+                Value::Function { .. } => value.clone(),
+                _ => resolve_value(value, environment)?,
+            };
             environment.insert(name.clone(), resolved);
         }
         Statement::FunctionCall { object, function, args } => {
-            if object == "con" && function == "Print" {
-                let mut rendered = Vec::new();
-                for arg in args {
-                    let value = resolve_value(arg, environment)?;
-                    rendered.push(format_value(value));
+            match object {
+                Some(obj) if obj == "con" && function == "Print" => {
+                    let mut rendered = Vec::new();
+                    for arg in args {
+                        let value = resolve_value(arg, environment)?;
+                        rendered.push(format_value(value));
+                    }
+                    println!("{}", rendered.join(" "));
                 }
-                println!("{}", rendered.join(" "));
+                Some(_) => {
+                    let callee = resolve_value(&Value::Variable(function.clone()), environment)?;
+                    match callee {
+                        Value::Function { params, body } => {
+                            let mut local_env = environment.clone();
+                            for (param, arg) in params.iter().zip(args.iter()) {
+                                let value = resolve_value(arg, environment)?;
+                                local_env.insert(param.clone(), value);
+                            }
+                            for stmt in body {
+                                execute_statement(&stmt, &mut local_env)?;
+                            }
+                        }
+                        _ => return Err(format!("{} is not callable", function)),
+                    }
+                }
+                None => {
+                    let callee = resolve_value(&Value::Variable(function.clone()), environment)?;
+                    match callee {
+                        Value::Function { params, body } => {
+                            let mut local_env = environment.clone();
+                            for (param, arg) in params.iter().zip(args.iter()) {
+                                let value = resolve_value(arg, environment)?;
+                                local_env.insert(param.clone(), value);
+                            }
+                            for stmt in body {
+                                execute_statement(&stmt, &mut local_env)?;
+                            }
+                        }
+                        _ => return Err(format!("{} is not callable", function)),
+                    }
+                }
             }
         }
         Statement::Event { object, name, body } => {
@@ -324,6 +406,7 @@ fn format_value(value: Value) -> String {
         Value::String(v) => v,
         Value::Logic(v) => v.to_string(),
         Value::Variable(v) => v,
+        Value::Function { .. } => "<function>".to_string(),
     }
 }
 
@@ -348,6 +431,17 @@ mod tests {
     #[test]
     fn parses_null_variable_and_literal() {
         let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local empty null = null\n    con.Print(empty)\n}\n";
+
+        let program = Parser::parse(source).unwrap();
+        assert!(matches!(
+            &program.statements[0],
+            Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
+        ));
+    }
+
+    #[test]
+    fn parses_function_as_variable_and_call() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local add function = (a, b) {\n        con.Print(a, b)\n    }\n    add(\"hi\", 42)\n}\n";
 
         let program = Parser::parse(source).unwrap();
         assert!(matches!(
