@@ -1,9 +1,26 @@
 [SCRIPTTYPE KALVITA VERSION 1]
 kal.OnStart {
+    // ---------- Setup ----------
     var local score number = 7
-    var local args array = ["The score is ", var.score]
-    var local enemy object = { health: 40, damage: 5, speed: 10 }
+    var local level number = 3
+    var local bonus number = 2
+    var local ready logic = true
+    var local label string = "kalvita demo"
+    var local empty null = null
 
+    var local names array = ["nova", "kael", "lyra", "mira"]
+    var local numbers array = [12, 64, 9, 747, 11, 28]
+    var local args array = ["The score is ", var.score]
+    var local matrix array = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    var local nested array = ["root", ["branch", ["leaf", "twig"]], "end"]
+
+    var local hero object = { name: "Astra", health: 90, damage: 12, speed: 8 }
+    var local enemy object = { health: 40, damage: 5, speed: 10 }
+    var local world object = { status: "running", seed: 1337 }
+
+    var local message string = "Kalvita is array-first and expression-driven"
+
+    // ---------- Function variables ----------
     var local add function = (a, b) {
         con.Print("arg bundle = ", arg)
         con.Print("arg.a = ", arg.a)
@@ -11,31 +28,113 @@ kal.OnStart {
         return(arg.a + arg.b)
     }
 
-    var local readEnemy function = () {
-        con.Print("enemy health = ", var.enemy.health)
-        con.Print("enemy damage = ", var.enemy.damage)
-        return(var.enemy.health + var.enemy.damage)
+    var local greet function = (name, mood) {
+        con.Print("Hello ", arg.name, "! Mood: ", arg.mood)
+        return("welcome to kalvita")
     }
 
+    var local readHero function = () {
+        con.Print("hero name = ", var.hero.name)
+        con.Print("hero health = ", var.hero.health)
+        con.Print("hero speed = ", var.hero.speed)
+        return(var.hero.health + var.enemy.damage)
+    }
+
+    var local applyBonus function = (value) {
+        con.Print("before bonus = ", arg.value)
+        con.Print("after bonus = ", arg.value + var.bonus)
+        return(arg.value + var.bonus)
+    }
+
+    var local makeSummary function = () {
+        var local summary array = ["score:", var.score, "level:", var.level, "ready:", var.ready]
+        con.Print("summary = ", var.summary)
+        return(var.summary)
+    }
+
+    // ---------- Prints and expressions ----------
+    con.Print("========================================================")
+    con.Print("Kalvita sample script")
+    con.Print("========================================================")
+    con.Print("label = ", var.label)
+    con.Print("message = ", var.message)
+    con.Print("empty = ", var.empty)
     con.Print("args = ", var.args)
+    con.Print("names = ", var.names)
+    con.Print("numbers = ", var.numbers)
+    con.Print("matrix[1][2] = ", var.matrix[1][2])
+    con.Print("nested[1][0] = ", var.nested[1][0])
+
+    con.Print("score + level = ", var.score + var.level)
+    con.Print("score * bonus = ", var.score * var.bonus)
+    con.Print("numbers + 10 = ", var.numbers + 10)
+    con.Print("numbers * 2 = ", var.numbers * 2)
+    con.Print("hero health = ", var.hero.health)
+    con.Print("enemy health = ", var.enemy.health)
+    con.Print("world status = ", var.world.status)
+
+    // ---------- Function calls ----------
     con.Print("sum = ", add(15 + 2, 5))
-    con.Print("enemy total = ", readEnemy())
+    con.Print("greet = ", greet("Nova", "happy"))
+    con.Print("bonus result = ", applyBonus(20))
+    con.Print("hero result = ", readHero())
+    con.Print("summary = ", makeSummary())
 
-    con.Print("sin(0) = ", math.Sin(0))
-    con.Print("cos(0) = ", math.Cos(0))
-    con.Print("tan(0) = ", math.Tan(0))
+    // ---------- Array-first arguments ----------
+    var local captureArgs function = () {
+        con.Print("argument array = ", arg)
+        con.Print("first item = ", arg[0][0])
+        con.Print("second item = ", arg[0][1])
+        return(arg)
+    }
 
+    con.Print("captured = ", captureArgs(["hello", var.score, 3, ["nested", "array"]]))
+    con.Print("stored args = ", var.args)
+
+    // ---------- Logic and control flow ----------
     if (var.score > 5) {
         con.Print("score is greater than 5")
+    } elseif (var.score == 7) {
+        con.Print("score is exactly 7")
     } else {
-        con.Print("score is not greater than 5")
+        con.Print("score is something else")
     }
 
-    if (true and true) {
-        con.Print("logic gates work")
+    if (var.ready == true and var.level > 1) {
+        con.Print("systems are ready and level is high")
+    } else {
+        con.Print("system not ready")
     }
 
     if (not false) {
         con.Print("not operator works")
     }
+
+    if (true or false) {
+        con.Print("or logic works")
+    }
+
+    if (true and true and not false) {
+        con.Print("all gates are working")
+    }
+
+    // ---------- Math utilities ----------
+    con.Print("sin(0) = ", math.Sin(0))
+    con.Print("cos(0) = ", math.Cos(0))
+    con.Print("tan(0) = ", math.Tan(0))
+    con.Print("sin(1) = ", math.Sin(1))
+    con.Print("cos(1) = ", math.Cos(1))
+    con.Print("tan(1) = ", math.Tan(1))
+
+    // ---------- Reassignment ----------
+    con.Print("before redeclare score = ", var.score)
+    var local score number = 15
+    con.Print("after redeclare score = ", var.score)
+
+    // ---------- Final section ----------
+    var local finalWords array = ["kalvita", "rocks", "with", "arrays", "and", "functions"]
+    con.Print("finalWords = ", var.finalWords)
+    con.Print("finalWords[3] = ", var.finalWords[3])
+    con.Print("done")
+    con.Print("========================================================")
 }
