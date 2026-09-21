@@ -1,5 +1,6 @@
-mod pain; // 1. Tells Rust to look for tools.rs
+mod lexer;
 
 fn main() {
-    println!("Hello, three worlds!");
+    let mut lexer = lexer::Lexer::new("let x = 42;\nfn add(a, b) -> int { a + b }");
+    println!("{:#?}", lexer.tokenize());
 }
