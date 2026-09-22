@@ -2,6 +2,8 @@
 pub enum Token {
     Var,
     Local,
+    Global,
+    Declare,
     Null,
     Function,
     Return,
@@ -210,6 +212,8 @@ impl Lexer {
                     let token = match ident.as_str() {
                         "var" => Token::Var,
                         "local" => Token::Local,
+                        "global" => Token::Global,
+                        "declare" => Token::Declare,
                         "null" => Token::Null,
                         "function" => Token::Function,
                         "return" => Token::Return,
