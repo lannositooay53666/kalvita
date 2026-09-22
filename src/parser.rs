@@ -59,6 +59,10 @@ pub enum Value {
         params: Vec<String>,
         body: Vec<Statement>,
     },
+    Error {
+        error_type: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -98,6 +102,20 @@ pub enum Statement {
     },
     Break,
     Continue,
+    Throw {
+        error_type: String,
+        message: Box<Value>,
+    },
+    Try {
+        body: Vec<Statement>,
+        catches: Vec<CatchClause>,
+    },
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct CatchClause {
+    pub error_type: String,
+    pub body: Vec<Statement>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -166,6 +184,9 @@ impl Parser {
                 self.index += 1;
                 Ok(Statement::Continue)
             }
+            Some(Token::Try) => self.parse_try_statement(),
+            Some(Token::Throw) => self.parse_throw_statement(),
+            Some(Token::Catch) => Err("catch must be inside try".to_string()),
             Some(Token::Identifier(_)) => {
                 let name = self.consume_identifier()?;
 
@@ -273,6 +294,41 @@ impl Parser {
             iterable,
             body,
         })
+    }
+
+    fn parse_throw_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Throw)?;
+        self.expect(Token::LParen)?;
+        let error_type = self.consume_identifier()?;
+        self.expect(Token::Comma)?;
+        let message = self.parse_expression()?;
+        self.expect(Token::RParen)?;
+        Ok(Statement::Throw {
+            error_type,
+            message: Box::new(message),
+        })
+    }
+
+    fn parse_try_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Try)?;
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        let mut catches = Vec::new();
+        while !matches!(self.peek(), Some(Token::RBrace) | Some(Token::Eof)) {
+            if matches!(self.peek(), Some(Token::Catch)) {
+                self.expect(Token::Catch)?;
+                self.expect(Token::LParen)?;
+                let error_type = self.consume_identifier()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let catch_body = self.parse_block_contents()?;
+                catches.push(CatchClause { error_type, body: catch_body });
+            } else {
+                body.push(self.parse_statement()?);
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Statement::Try { body, catches })
     }
 
     fn parse_variable_decl(&mut self) -> Result<Statement, String> {
@@ -768,19 +824,54 @@ enum Flow {
     Return(Value),
 }
 
+/// Catchable typed error vs fatal (uncatchable) runtime failure.
+/// `Fatal` aborts with `Runtime error: ...`; `Throw` carries a
+/// `Value::Error` that the nearest enclosing `try` can catch.
+#[derive(Debug, PartialEq, Clone)]
+enum RuntimeFault {
+    Fatal(String),
+    Throw(Value),
+}
+
+impl From<String> for RuntimeFault {
+    fn from(msg: String) -> Self {
+        RuntimeFault::Fatal(msg)
+    }
+}
+
+fn fatal_err(msg: impl Into<String>) -> RuntimeFault {
+    RuntimeFault::Fatal(msg.into())
+}
+
+fn throw_err(error_type: &str, message: impl Into<String>) -> RuntimeFault {
+    RuntimeFault::Throw(Value::Error {
+        error_type: error_type.to_string(),
+        message: message.into(),
+    })
+}
+
+fn uncaught_message(err: &Value) -> String {
+    match err {
+        Value::Error { error_type, message } => format!("Uncaught {}: {}", error_type, message),
+        other => format!("Uncaught error: {:?}", other),
+    }
+}
+
 const MAX_LOOP_ITERS: usize = 1_000_000;
 
 pub fn execute(program: &Program) -> Result<(), String> {
     let mut environment: HashMap<String, Value> = HashMap::new();
 
     for statement in &program.statements {
-        match execute_statement(statement, &mut environment)? {
-            Flow::Normal => {}
-            Flow::Break => return Err("break outside loop".to_string()),
-            Flow::Continue => return Err("continue outside loop".to_string()),
-            Flow::Return(_) => {
+        match execute_statement(statement, &mut environment) {
+            Ok(Flow::Normal) => {}
+            Ok(Flow::Break) => return Err("break outside loop".to_string()),
+            Ok(Flow::Continue) => return Err("continue outside loop".to_string()),
+            Ok(Flow::Return(_)) => {
                 return Err("return can only be used inside a function body".to_string())
             }
+            Err(RuntimeFault::Fatal(msg)) => return Err(msg),
+            Err(RuntimeFault::Throw(err)) => return Err(uncaught_message(&err)),
         }
     }
 
@@ -790,7 +881,7 @@ pub fn execute(program: &Program) -> Result<(), String> {
 fn execute_block(
     statements: &[Statement],
     environment: &mut HashMap<String, Value>,
-) -> Result<Flow, String> {
+) -> Result<Flow, RuntimeFault> {
     for stmt in statements {
         match execute_statement(stmt, environment)? {
             Flow::Normal => {}
@@ -805,7 +896,7 @@ fn invoke_function(
     function: &str,
     args: &[Value],
     environment: &HashMap<String, Value>,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<Value>, RuntimeFault> {
     match object {
         Some(obj) if obj == "con" && function == "Print" => {
             let mut rendered = Vec::new();
@@ -819,24 +910,24 @@ fn invoke_function(
         Some(obj) if obj == "math" => {
             let value = match args {
                 [arg] => resolve_value(arg, environment)?,
-                _ => return Err(format!("{} expects exactly one argument", function)),
+                _ => return Err(throw_err("ValueError", format!("{} expects exactly one argument", function))),
             };
             let number = match value {
                 Value::Number(value) => value,
-                _ => return Err(format!("{} expects a numeric argument", function)),
+                _ => return Err(throw_err("TypeError", format!("{} expects a numeric argument", function))),
             };
 
             match function {
                 "Sin" => Ok(Some(Value::Number(number.sin()))),
                 "Cos" => Ok(Some(Value::Number(number.cos()))),
                 "Tan" => Ok(Some(Value::Number(number.tan()))),
-                _ => Err(format!("Unknown math function: {}", function)),
+                _ => Err(throw_err("NameError", format!("Unknown math function: {}", function))),
             }
         }
         _ => {
             let passed_value = match object {
                 Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment)
-                    .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| format!("Unknown variable: {}", obj)))?,
+                    .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", obj))))?,
                 None => Value::Null,
             };
 
@@ -846,25 +937,25 @@ fn invoke_function(
             {
                 let target = match object {
                     Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment)
-                        .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| format!("Unknown variable: {}", obj)))?,
-                    None => return Err("case-sensitive equality requires a target value".to_string()),
+                        .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", obj))))?,
+                    None => return Err(throw_err("ValueError", "case-sensitive equality requires a target value")),
                 };
 
                 let rhs = match args {
                     [value] => resolve_value(value, environment)?,
-                    _ => return Err("case-sensitive equality expects exactly one argument".to_string()),
+                    _ => return Err(throw_err("ValueError", "case-sensitive equality expects exactly one argument")),
                 };
 
                 match (target, rhs) {
                     (Value::String(lhs), Value::String(rhs)) => return Ok(Some(Value::Logic(lhs == rhs))),
-                    _ => return Err("case-sensitive equality requires two strings".to_string()),
+                    _ => return Err(throw_err("TypeError", "case-sensitive equality requires two strings")),
                 }
             }
 
             let callee = resolve_value(&Value::Variable(function.to_string()), environment)
                 .or_else(|_| {
                     let prefixed = format!("var.{}", function);
-                    environment.get(&prefixed).cloned().ok_or_else(|| format!("Unknown variable: {}", function))
+                    environment.get(&prefixed).cloned().ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", function)))
                 })?;
 
             match callee {
@@ -873,7 +964,7 @@ fn invoke_function(
                     let argument_array = Value::Array(
                         args.iter()
                             .map(|arg| resolve_value(arg, environment))
-                            .collect::<Result<Vec<_>, String>>()?,
+                            .collect::<Result<Vec<_>, RuntimeFault>>()?,
                     );
                     local_env.insert("pass".to_string(), passed_value);
                     local_env.insert("arg".to_string(), argument_array.clone());
@@ -889,10 +980,10 @@ fn invoke_function(
                         match execute_statement(&stmt, &mut local_env)? {
                             Flow::Normal => {}
                             Flow::Break => {
-                                return Err("break outside loop".to_string());
+                                return Err(fatal_err("break outside loop"));
                             }
                             Flow::Continue => {
-                                return Err("continue outside loop".to_string());
+                                return Err(fatal_err("continue outside loop"));
                             }
                             Flow::Return(value) => {
                                 result = Some(value);
@@ -902,7 +993,7 @@ fn invoke_function(
                     }
                     Ok(result)
                 }
-                _ => Err(format!("{} is not callable", function)),
+                _ => Err(throw_err("TypeError", format!("{} is not callable", function))),
             }
         }
     }
@@ -911,7 +1002,7 @@ fn invoke_function(
 fn execute_statement(
     statement: &Statement,
     environment: &mut HashMap<String, Value>,
-) -> Result<Flow, String> {
+) -> Result<Flow, RuntimeFault> {
     match statement {
         Statement::VariableDecl { name, value, .. } => {
             // Redeclare-as-assign: `var local x <type> = v` overwrites `var.x`
@@ -933,14 +1024,23 @@ fn execute_statement(
         }
         Statement::Break => Ok(Flow::Break),
         Statement::Continue => Ok(Flow::Continue),
+        Statement::Throw { error_type, message } => {
+            let resolved_msg = resolve_value(message, environment)?;
+            let text = match resolved_msg {
+                Value::String(s) => s,
+                other => format_value(other),
+            };
+            Err(throw_err(error_type, text))
+        }
+        Statement::Try { body, catches } => execute_try(body, catches, environment),
         Statement::Event { object, name, body } => {
             if object == "kal" && name == "OnStart" {
                 match execute_block(body, environment)? {
                     Flow::Normal => Ok(Flow::Normal),
-                    Flow::Break => Err("break outside loop".to_string()),
-                    Flow::Continue => Err("continue outside loop".to_string()),
+                    Flow::Break => Err(fatal_err("break outside loop")),
+                    Flow::Continue => Err(fatal_err("continue outside loop")),
                     Flow::Return(_) => {
-                        Err("return can only be used inside a function body".to_string())
+                        Err(fatal_err("return can only be used inside a function body"))
                     }
                 }
             } else {
@@ -983,7 +1083,7 @@ fn execute_statement(
                     Flow::Return(value) => return Ok(Flow::Return(value)),
                 }
             }
-            Err("possible infinite loop: while exceeded iteration limit".to_string())
+            Err(fatal_err("possible infinite loop: while exceeded iteration limit"))
         }
         Statement::ForIn { var, iterable, body } => {
             let resolved_iterable = resolve_value(iterable, environment)?;
@@ -991,9 +1091,9 @@ fn execute_statement(
                 Value::Array(items) => items,
                 Value::String(s) => s.chars().map(|ch| Value::String(ch.to_string())).collect(),
                 other => {
-                    return Err(format!(
-                        "for-in requires an array or string, got {:?}",
-                        other
+                    return Err(throw_err(
+                        "TypeError",
+                        format!("for-in requires an array or string, got {:?}", other),
                     ))
                 }
             };
@@ -1016,6 +1116,38 @@ fn execute_statement(
             restore_saved(environment, &key, saved);
             Ok(Flow::Normal)
         }
+    }
+}
+
+fn execute_try(
+    body: &[Statement],
+    catches: &[CatchClause],
+    environment: &mut HashMap<String, Value>,
+) -> Result<Flow, RuntimeFault> {
+    match execute_block(body, environment) {
+        Ok(flow) => Ok(flow),
+        Err(RuntimeFault::Throw(err_value)) => {
+            let thrown_type = match &err_value {
+                Value::Error { error_type, .. } => error_type.clone(),
+                _ => "Error".to_string(),
+            };
+            let handler = catches
+                .iter()
+                .find(|c| c.error_type == thrown_type || c.error_type == "Error");
+            match handler {
+                Some(catch) => {
+                    // Bind `var.err` for the handler (var. prefix; arg. untouched).
+                    let key = "var.err".to_string();
+                    let saved = environment.get(&key).cloned();
+                    environment.insert(key.clone(), err_value);
+                    let result = execute_block(&catch.body, environment);
+                    restore_saved(environment, &key, saved);
+                    result
+                }
+                None => Err(RuntimeFault::Throw(err_value)),
+            }
+        }
+        Err(other) => Err(other),
     }
 }
 
@@ -1050,10 +1182,10 @@ fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Op
     None
 }
 
-fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<Value, String> {
+fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<Value, RuntimeFault> {
     match value {
         Value::Variable(name) => resolve_variable_name(name, environment)
-            .ok_or_else(|| format!("Unknown variable: {}", name)),
+            .ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", name))),
         Value::FunctionCall { object, function, args } => {
             let result = invoke_function(object.as_deref(), function, args, environment)?;
             match result {
@@ -1065,7 +1197,7 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
             items
                 .iter()
                 .map(|item| resolve_value(item, environment))
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, RuntimeFault>>()?,
         )),
         Value::Object(map) => {
             let mut resolved = HashMap::new();
@@ -1077,9 +1209,14 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
         Value::Property { target, key } => {
             let target_value = resolve_value(target, environment)?;
             match target_value {
-                Value::Object(map) => map.get(key).cloned().ok_or_else(|| format!("Unknown property: {}", key)),
+                Value::Object(map) => map.get(key).cloned().ok_or_else(|| throw_err("NameError", format!("Unknown property: {}", key))),
+                Value::Error { error_type, message } => match key.as_str() {
+                    "type" => Ok(Value::String(error_type)),
+                    "message" => Ok(Value::String(message)),
+                    _ => Err(throw_err("NameError", format!("Unknown property: {}", key))),
+                },
                 Value::Null => Ok(Value::Null),
-                other => Err(format!("Property access requires an object, got {:?}", other)),
+                other => Err(throw_err("TypeError", format!("Property access requires an object, got {:?}", other))),
             }
         }
         Value::Index { target, index } => {
@@ -1090,17 +1227,17 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
                     let idx = index as usize;
                     items.get(idx)
                         .cloned()
-                        .ok_or_else(|| format!("Index out of bounds: {}", idx))
+                        .ok_or_else(|| throw_err("IndexError", format!("Index out of bounds: {}", idx)))
                 }
                 (Value::String(value), Value::Number(index)) => {
                     let idx = index as usize;
                     let ch = value
                         .chars()
                         .nth(idx)
-                        .ok_or_else(|| format!("Index out of bounds: {}", idx))?;
+                        .ok_or_else(|| throw_err("IndexError", format!("Index out of bounds: {}", idx)))?;
                     Ok(Value::String(ch.to_string()))
                 }
-                _ => Err("Index requires an array or string with a numeric index".to_string()),
+                _ => Err(throw_err("TypeError", "Index requires an array or string with a numeric index")),
             }
         }
         Value::Binary { left, op, right } => {
@@ -1116,13 +1253,13 @@ fn resolve_value(value: &Value, environment: &HashMap<String, Value>) -> Result<
     }
 }
 
-fn evaluate_unary(value: Value, op: &UnaryOperator) -> Result<Value, String> {
+fn evaluate_unary(value: Value, op: &UnaryOperator) -> Result<Value, RuntimeFault> {
     match op {
         UnaryOperator::Not => Ok(Value::Logic(!is_truthy(&value))),
     }
 }
 
-fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, String> {
+fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, RuntimeFault> {
     match op {
         BinaryOperator::Add => match (left, right) {
             (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
@@ -1132,28 +1269,28 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
             (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             (Value::String(a), Value::Number(b)) => Ok(Value::String(format!("{}{}", a, b))),
             (Value::Number(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-            _ => Err("Addition requires numbers or strings".to_string()),
+            _ => Err(throw_err("TypeError", "Addition requires numbers or strings")),
         },
         BinaryOperator::Subtract => match (left, right) {
             (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a - b)),
-            _ => Err("Subtraction requires numbers".to_string()),
+            _ => Err(throw_err("TypeError", "Subtraction requires numbers")),
         },
         BinaryOperator::Multiply => match (left, right) {
             (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) => Ok(Value::Number(a * b)),
-            _ => Err("Multiplication requires numbers".to_string()),
+            _ => Err(throw_err("TypeError", "Multiplication requires numbers")),
         },
         BinaryOperator::Divide => match (left, right) {
             (Value::Array(left_items), Value::Array(right_items)) => apply_array_array_op(left_items, right_items, op),
             (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
             (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
             (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
-            _ => Err("Division requires non-zero numbers".to_string()),
+            _ => Err(throw_err("DivZero", "Division requires non-zero numbers")),
         },
         BinaryOperator::Equal => match (&left, &right) {
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a.eq_ignore_ascii_case(b))),
@@ -1172,37 +1309,37 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
         BinaryOperator::Greater => match (left, right) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a > b)),
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a > b)),
-            _ => Err("Greater-than requires comparable values".to_string()),
+            _ => Err(throw_err("TypeError", "Greater-than requires comparable values")),
         },
         BinaryOperator::Less => match (left, right) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a < b)),
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a < b)),
-            _ => Err("Less-than requires comparable values".to_string()),
+            _ => Err(throw_err("TypeError", "Less-than requires comparable values")),
         },
         BinaryOperator::GreaterEqual => match (left, right) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a >= b)),
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a >= b)),
-            _ => Err("Greater-or-equal requires comparable values".to_string()),
+            _ => Err(throw_err("TypeError", "Greater-or-equal requires comparable values")),
         },
         BinaryOperator::LessEqual => match (left, right) {
             (Value::Number(a), Value::Number(b)) => Ok(Value::Logic(a <= b)),
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a <= b)),
-            _ => Err("Less-or-equal requires comparable values".to_string()),
+            _ => Err(throw_err("TypeError", "Less-or-equal requires comparable values")),
         },
     }
 }
 
-fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) -> Result<Value, String> {
+fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) -> Result<Value, RuntimeFault> {
     let scalar_number = match scalar {
         Value::Number(value) => value,
-        _ => return Err(format!("Array math requires a numeric scalar, got {:?}", scalar)),
+        _ => return Err(throw_err("TypeError", format!("Array math requires a numeric scalar, got {:?}", scalar))),
     };
 
     let mut result = Vec::new();
     for item in items {
         let current = match item {
             Value::Number(value) => value,
-            _ => return Err("Array math only works on numeric arrays".to_string()),
+            _ => return Err(throw_err("TypeError", "Array math only works on numeric arrays")),
         };
 
         let transformed = match op {
@@ -1210,8 +1347,8 @@ fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) 
             BinaryOperator::Subtract => current - scalar_number,
             BinaryOperator::Multiply => current * scalar_number,
             BinaryOperator::Divide if scalar_number != 0.0 => current / scalar_number,
-            BinaryOperator::Divide => return Err("Division by zero in array math".to_string()),
-            _ => return Err("Unsupported array operation".to_string()),
+            BinaryOperator::Divide => return Err(throw_err("DivZero", "Division by zero in array math")),
+            _ => return Err(throw_err("TypeError", "Unsupported array operation")),
         };
         result.push(Value::Number(transformed));
     }
@@ -1219,7 +1356,7 @@ fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) 
     Ok(Value::Array(result))
 }
 
-fn apply_array_array_op(left_items: Vec<Value>, right_items: Vec<Value>, op: &BinaryOperator) -> Result<Value, String> {
+fn apply_array_array_op(left_items: Vec<Value>, right_items: Vec<Value>, op: &BinaryOperator) -> Result<Value, RuntimeFault> {
     let max_len = left_items.len().max(right_items.len());
     let mut result = Vec::with_capacity(max_len);
 
@@ -1243,6 +1380,7 @@ fn is_truthy(value: &Value) -> bool {
         Value::Number(value) => *value != 0.0,
         Value::String(value) => !value.is_empty(),
         Value::Null => false,
+        Value::Error { .. } => true,
         _ => true,
     }
 }
@@ -1254,6 +1392,7 @@ fn format_value(value: Value) -> String {
         Value::String(v) => v,
         Value::Logic(v) => v.to_string(),
         Value::Variable(v) => v,
+        Value::Error { error_type, message } => format!("{}: {}", error_type, message),
         Value::Array(items) => {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
