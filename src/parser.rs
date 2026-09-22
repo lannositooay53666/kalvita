@@ -76,6 +76,9 @@ pub enum Value {
         error_type: String,
         message: String,
     },
+    File {
+        path: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1098,9 +1101,15 @@ impl Parser {
                 self.index += 1;
                 Ok("object".to_string())
             }
+            // `file` stays a plain identifier (so `file.Read(...)` keeps
+            // parsing as a namespaced call) and is only special here.
+            Some(Token::Identifier(name)) if name == "file" => {
+                self.index += 1;
+                Ok("file".to_string())
+            }
             Some(Token::Identifier(name)) => {
                 return Err(format!(
-                    "Expected type name (string, number, logic, null, array, object, function), found '{}'",
+                    "Expected type name (string, number, logic, null, array, object, file, function), found '{}'",
                     name
                 ));
             }

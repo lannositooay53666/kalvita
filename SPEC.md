@@ -24,7 +24,7 @@ var.hero.health = 50             // nested property/index assignment
 var.pair[0] = 99
 ```
 
-Types (`string number logic null array object function`) are enforced at
+Types (`string number logic null array object file function`) are enforced at
 write time: declaring, redeclaring, or assigning a mismatched value is a
 catchable `TypeError` (`expected number for var.n, got string`). `null`
 fits every slot. Redeclaring with a new type resets the slot. Anything else
@@ -119,6 +119,19 @@ Abs/Pow/Min/Max/Clamp/Random`, `str.Len/Upper/Lower/Split/Join/Contains/
 Replace/Trim/Sub/From/ToNum`, `arr.Len/Push/Pop/Reverse/Sort/Join/Keys/Has/
 Get/Slice`, `time.Now()` (unix ms), `file.Read/Write`. Array builtins return
 new arrays (`var.xs = arr.Push(var.xs, 4)`).
+
+File variables hold paths selected up front — no I/O happens at select
+time, so missing files surface later as catchable `IOError`:
+
+```kal
+var local myfile file = selectFile("/tmp/notes.txt")
+file.Write(var.myfile, "hello file")
+con.Print(file.Read(var.myfile))
+```
+
+`file.Read`/`file.Write` also accept plain path strings
+(`file.Read("/tmp/notes.txt")`), and a user-defined `selectFile` function
+takes precedence over the builtin.
 
 ## 9. CLI
 

@@ -893,6 +893,44 @@ fn invoke_str(
     }
 }
 
+/// Accept a path string or an open `file` variable for file builtins.
+fn resolve_file_target(target: &Value) -> Result<String, RuntimeFault> {
+    match target {
+        Value::String(path) => Ok(path.clone()),
+        Value::File { path } => Ok(path.clone()),
+        other => Err(throw_err(
+            "TypeError",
+            format!("expected a path string or file variable, got {:?}", other),
+        )),
+    }
+}
+
+/// Bare `selectFile(path)` builtin: wraps a path into a `file` value for
+/// `var local f file = selectFile("./notes.txt")`. No I/O happens here;
+/// `file.Read`/`file.Write` report missing files as catchable `IOError`.
+fn select_file_builtin(
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Value, RuntimeFault> {
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
+    match resolved.as_slice() {
+        [Value::String(path)] => {
+            if path.trim().is_empty() {
+                return Err(throw_err("ValueError", "selectFile needs a non-empty path"));
+            }
+            Ok(Value::File { path: path.clone() })
+        }
+        [other] => Err(throw_err(
+            "TypeError",
+            format!("selectFile expects a path string, got {:?}", other),
+        )),
+        _ => Err(throw_err("ValueError", "selectFile expects exactly one path")),
+    }
+}
+
 fn substring(s: String, start: i64, len: Option<i64>) -> Result<String, RuntimeFault> {
     if start < 0 {
         return Err(throw_err("ValueError", "Sub start must be >= 0"));
@@ -1210,11 +1248,11 @@ fn invoke_function(
             match function {
                 "Read" => {
                     let path = match resolved.as_slice() {
-                        [Value::String(path)] => path.clone(),
+                        [target] => resolve_file_target(target)?,
                         _ => {
                             return Err(throw_err(
                                 "ValueError",
-                                "Read expects exactly one path string",
+                                "Read expects a path string or file variable",
                             ))
                         }
                     };
@@ -1225,11 +1263,11 @@ fn invoke_function(
                 }
                 "Write" => {
                     let (path, content) = match resolved.as_slice() {
-                        [Value::String(path), content] => (path.clone(), stringify_value(content)),
+                        [target, content] => (resolve_file_target(target)?, stringify_value(content)),
                         _ => {
                             return Err(throw_err(
                                 "ValueError",
-                                "Write expects a path string and content",
+                                "Write expects a path string or file variable, plus content",
                             ))
                         }
                     };
@@ -1271,10 +1309,22 @@ fn invoke_function(
                 }
             }
 
-            let callee = resolve_value(&Value::Variable(function.to_string()), environment, types, rt, cur)
+            let callee = match resolve_value(&Value::Variable(function.to_string()), environment, types, rt, cur)
                 .or_else(|_| {
                     lookup_scoped(function, environment, rt, cur).ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", function)))
-                })?;
+                }) {
+                Ok(callee) => callee,
+                // Bare `selectFile(path)` builtin. User-defined functions
+                // take precedence: only reached when no such variable exists.
+                Err(RuntimeFault::Throw(Value::Error { error_type, .. }))
+                    if error_type == "NameError"
+                        && function == "selectFile"
+                        && object.is_none() =>
+                {
+                    return select_file_builtin(args, environment, types, rt, cur).map(Some);
+                }
+                Err(other) => return Err(other),
+            };
 
             match callee {
                 Value::Function {
@@ -1333,6 +1383,7 @@ fn check_type(slot: &str, type_name: &str, value: &Value) -> Result<(), RuntimeF
         ("null", Value::Null) => true,
         ("array", Value::Array(_)) => true,
         ("object", Value::Object(_)) => true,
+        ("file", Value::File { .. }) => true,
         ("function", Value::Function { .. }) => true,
         _ => false,
     };
@@ -1359,6 +1410,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Logic(_) => "logic",
         Value::Variable(_) => "variable",
         Value::Object(_) => "object",
+        Value::File { .. } => "file",
         Value::Array(_) => "array",
         Value::Index { .. } => "index",
         Value::FunctionCall { .. } => "function-call",
@@ -2295,6 +2347,7 @@ fn is_truthy(value: &Value) -> bool {
         Value::String(value) => !value.is_empty(),
         Value::Null => false,
         Value::Error { .. } => true,
+        Value::File { .. } => true,
         _ => true,
     }
 }
@@ -2307,6 +2360,7 @@ fn format_value(value: Value) -> String {
         Value::Logic(v) => v.to_string(),
         Value::Variable(v) => v,
         Value::Error { error_type, message } => format!("{}: {}", error_type, message),
+        Value::File { path } => format!("file({})", path),
         Value::Array(items) => {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
@@ -3412,5 +3466,60 @@ mod tests {
         let (env, err) = run_with_types(source);
         assert!(err.is_none(), "redeclare resets: {:?}", err);
         assert_eq!(env.get("var.xs"), Some(&Value::Number(5.0)));
+    }
+
+    #[test]
+    fn file_variables_round_trip() {
+        let dir = std::env::temp_dir().join("kalvita_file_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("note.txt");
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local myfile file = selectFile(\"{}\")\n    file.Write(var.myfile, \"hello file\")\n    var local back string = file.Read(var.myfile)\n    con.Print(var.back)\n}}\n",
+            target.display()
+        );
+        let (env, err) = run_with_types(&source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.back"),
+            Some(&Value::String("hello file".to_string()))
+        );
+        assert!(matches!(
+            env.get("var.myfile"),
+            Some(Value::File { .. })
+        ));
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn file_type_is_enforced_and_select_validates() {
+        // Non-file value into a file slot.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local myfile file = \"nope\"\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("TypeError"));
+        // selectFile arity + type errors.
+        for call in ["selectFile()", "selectFile(1, 2)", "selectFile(42)"] {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local f file = {}\n}}\n",
+                call
+            );
+            let (_, err) = run_with_types(&source);
+            assert!(err.is_some(), "{} should fail", call);
+        }
+        // Legacy string paths still work.
+        let dir = std::env::temp_dir().join("kalvita_file_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("legacy.txt");
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    file.Write(\"{}\", \"legacy\")\n    var local back string = file.Read(\"{}\")\n}}\n",
+            target.display(),
+            target.display()
+        );
+        let (env, err) = run_with_types(&source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.back"),
+            Some(&Value::String("legacy".to_string()))
+        );
+        let _ = std::fs::remove_file(&target);
     }
 }
