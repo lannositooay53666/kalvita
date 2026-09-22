@@ -9,6 +9,8 @@ pub enum BinaryOperator {
     Divide,
     Equal,
     NotEqual,
+    StrictEqual,
+    StrictNotEqual,
     And,
     Or,
     Greater,
@@ -85,6 +87,17 @@ pub enum Statement {
         else_if_branches: Vec<(Value, Vec<Statement>)>,
         else_branch: Option<Vec<Statement>>,
     },
+    While {
+        condition: Value,
+        body: Vec<Statement>,
+    },
+    ForIn {
+        var: String,
+        iterable: Value,
+        body: Vec<Statement>,
+    },
+    Break,
+    Continue,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -143,6 +156,16 @@ impl Parser {
             Some(Token::Var) => self.parse_variable_decl(),
             Some(Token::Return) => self.parse_return_statement(),
             Some(Token::If) => self.parse_if_statement(),
+            Some(Token::While) => self.parse_while_statement(),
+            Some(Token::For) => self.parse_for_statement(),
+            Some(Token::Break) => {
+                self.index += 1;
+                Ok(Statement::Break)
+            }
+            Some(Token::Continue) => {
+                self.index += 1;
+                Ok(Statement::Continue)
+            }
             Some(Token::Identifier(_)) => {
                 let name = self.consume_identifier()?;
 
@@ -221,6 +244,34 @@ impl Parser {
             then_branch,
             else_if_branches,
             else_branch,
+        })
+    }
+
+    fn parse_while_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::While)?;
+        self.expect(Token::LParen)?;
+        let condition = self.parse_expression()?;
+        self.expect(Token::RParen)?;
+        self.expect(Token::LBrace)?;
+        let body = self.parse_block_contents()?;
+        Ok(Statement::While { condition, body })
+    }
+
+    fn parse_for_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::For)?;
+        self.expect(Token::LParen)?;
+        // for (name in iterable) binds var.<name> each iteration.
+        // Also accept `for (var.name in ...)`? No - keep bare `name`.
+        let loop_var = self.consume_identifier()?;
+        self.expect(Token::In)?;
+        let iterable = self.parse_expression()?;
+        self.expect(Token::RParen)?;
+        self.expect(Token::LBrace)?;
+        let body = self.parse_block_contents()?;
+        Ok(Statement::ForIn {
+            var: loop_var,
+            iterable,
+            body,
         })
     }
 
@@ -478,6 +529,22 @@ impl Parser {
         while matches!(self.peek(), Some(Token::Dot)) {
             self.expect(Token::Dot)?;
             let key = self.consume_identifier()?;
+            if self.matches(Token::LParen) {
+                let args = self.parse_arguments()?;
+                let object = match &value {
+                    Value::Variable(name) => Some(name.clone()),
+                    _ => None,
+                };
+                if let Some(object_name) = object {
+                    value = Value::FunctionCall {
+                        object: Some(object_name),
+                        function: key,
+                        args,
+                    };
+                    break;
+                }
+                return Err(format!("Method call target is not resolvable: {:?}", value));
+            }
             value = Value::Property {
                 target: Box::new(value),
                 key,
@@ -555,11 +622,21 @@ impl Parser {
         match self.peek() {
             Some(Token::Equal) => {
                 self.index += 1;
-                Ok(BinaryOperator::Equal)
+                if self.matches(Token::Equal) {
+                    self.index += 1;
+                    Ok(BinaryOperator::StrictEqual)
+                } else {
+                    Ok(BinaryOperator::Equal)
+                }
             }
             Some(Token::NotEqual) => {
                 self.index += 1;
-                Ok(BinaryOperator::NotEqual)
+                if self.matches(Token::Equal) {
+                    self.index += 1;
+                    Ok(BinaryOperator::StrictNotEqual)
+                } else {
+                    Ok(BinaryOperator::NotEqual)
+                }
             }
             Some(Token::GreaterThan) => {
                 self.index += 1;
@@ -683,14 +760,44 @@ impl Parser {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+enum Flow {
+    Normal,
+    Break,
+    Continue,
+    Return(Value),
+}
+
+const MAX_LOOP_ITERS: usize = 1_000_000;
+
 pub fn execute(program: &Program) -> Result<(), String> {
     let mut environment: HashMap<String, Value> = HashMap::new();
 
     for statement in &program.statements {
-        execute_statement(statement, &mut environment)?;
+        match execute_statement(statement, &mut environment)? {
+            Flow::Normal => {}
+            Flow::Break => return Err("break outside loop".to_string()),
+            Flow::Continue => return Err("continue outside loop".to_string()),
+            Flow::Return(_) => {
+                return Err("return can only be used inside a function body".to_string())
+            }
+        }
     }
 
     Ok(())
+}
+
+fn execute_block(
+    statements: &[Statement],
+    environment: &mut HashMap<String, Value>,
+) -> Result<Flow, String> {
+    for stmt in statements {
+        match execute_statement(stmt, environment)? {
+            Flow::Normal => {}
+            other => return Ok(other),
+        }
+    }
+    Ok(Flow::Normal)
 }
 
 fn invoke_function(
@@ -733,6 +840,27 @@ fn invoke_function(
                 None => Value::Null,
             };
 
+            if function.eq_ignore_ascii_case("EqualsCaseSensitive")
+                || function.eq_ignore_ascii_case("caseSensitiveEquals")
+                || function.eq_ignore_ascii_case("CaseSensitiveEquals")
+            {
+                let target = match object {
+                    Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment)
+                        .or_else(|_| environment.get(&format!("var.{}", obj)).cloned().ok_or_else(|| format!("Unknown variable: {}", obj)))?,
+                    None => return Err("case-sensitive equality requires a target value".to_string()),
+                };
+
+                let rhs = match args {
+                    [value] => resolve_value(value, environment)?,
+                    _ => return Err("case-sensitive equality expects exactly one argument".to_string()),
+                };
+
+                match (target, rhs) {
+                    (Value::String(lhs), Value::String(rhs)) => return Ok(Some(Value::Logic(lhs == rhs))),
+                    _ => return Err("case-sensitive equality requires two strings".to_string()),
+                }
+            }
+
             let callee = resolve_value(&Value::Variable(function.to_string()), environment)
                 .or_else(|_| {
                     let prefixed = format!("var.{}", function);
@@ -758,12 +886,18 @@ fn invoke_function(
 
                     let mut result = None;
                     for stmt in body {
-                        match stmt {
-                            Statement::Return { value } => {
-                                result = Some(resolve_value(&value, &local_env)?);
+                        match execute_statement(&stmt, &mut local_env)? {
+                            Flow::Normal => {}
+                            Flow::Break => {
+                                return Err("break outside loop".to_string());
+                            }
+                            Flow::Continue => {
+                                return Err("continue outside loop".to_string());
+                            }
+                            Flow::Return(value) => {
+                                result = Some(value);
                                 break;
                             }
-                            _ => execute_statement(&stmt, &mut local_env)?,
                         }
                     }
                     Ok(result)
@@ -774,26 +908,43 @@ fn invoke_function(
     }
 }
 
-fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Value>) -> Result<(), String> {
+fn execute_statement(
+    statement: &Statement,
+    environment: &mut HashMap<String, Value>,
+) -> Result<Flow, String> {
     match statement {
         Statement::VariableDecl { name, value, .. } => {
+            // Redeclare-as-assign: `var local x <type> = v` overwrites `var.x`
+            // if it already exists, otherwise creates it. Type is not enforced.
             let resolved = match value {
                 Value::Function { .. } => value.clone(),
                 _ => resolve_value(value, environment)?,
             };
             environment.insert(format!("var.{}", name), resolved);
+            Ok(Flow::Normal)
         }
         Statement::FunctionCall { object, function, args } => {
             let _ = invoke_function(object.as_deref(), function, args, environment)?;
+            Ok(Flow::Normal)
         }
         Statement::Return { value } => {
-            return Err("return can only be used inside a function body".to_string());
+            let resolved = resolve_value(value, environment)?;
+            Ok(Flow::Return(resolved))
         }
+        Statement::Break => Ok(Flow::Break),
+        Statement::Continue => Ok(Flow::Continue),
         Statement::Event { object, name, body } => {
             if object == "kal" && name == "OnStart" {
-                for inner in body {
-                    execute_statement(inner, environment)?;
+                match execute_block(body, environment)? {
+                    Flow::Normal => Ok(Flow::Normal),
+                    Flow::Break => Err("break outside loop".to_string()),
+                    Flow::Continue => Err("continue outside loop".to_string()),
+                    Flow::Return(_) => {
+                        Err("return can only be used inside a function body".to_string())
+                    }
                 }
+            } else {
+                Ok(Flow::Normal)
             }
         }
         Statement::If {
@@ -804,31 +955,83 @@ fn execute_statement(statement: &Statement, environment: &mut HashMap<String, Va
         } => {
             let condition_value = resolve_value(condition, environment)?;
             if is_truthy(&condition_value) {
-                for stmt in then_branch {
-                    execute_statement(stmt, environment)?;
-                }
-                return Ok(());
+                return execute_block(then_branch, environment);
             }
 
             for (else_if_condition, else_if_body) in else_if_branches {
                 let branch_value = resolve_value(else_if_condition, environment)?;
                 if is_truthy(&branch_value) {
-                    for stmt in else_if_body {
-                        execute_statement(stmt, environment)?;
-                    }
-                    return Ok(());
+                    return execute_block(else_if_body, environment);
                 }
             }
 
             if let Some(else_body) = else_branch {
-                for stmt in else_body {
-                    execute_statement(stmt, environment)?;
+                return execute_block(else_body, environment);
+            }
+            Ok(Flow::Normal)
+        }
+        Statement::While { condition, body } => {
+            for _ in 0..MAX_LOOP_ITERS {
+                let condition_value = resolve_value(condition, environment)?;
+                if !is_truthy(&condition_value) {
+                    return Ok(Flow::Normal);
+                }
+                match execute_block(body, environment)? {
+                    Flow::Normal => {}
+                    Flow::Break => return Ok(Flow::Normal),
+                    Flow::Continue => {}
+                    Flow::Return(value) => return Ok(Flow::Return(value)),
                 }
             }
+            Err("possible infinite loop: while exceeded iteration limit".to_string())
+        }
+        Statement::ForIn { var, iterable, body } => {
+            let resolved_iterable = resolve_value(iterable, environment)?;
+            let items: Vec<Value> = match resolved_iterable {
+                Value::Array(items) => items,
+                Value::String(s) => s.chars().map(|ch| Value::String(ch.to_string())).collect(),
+                other => {
+                    return Err(format!(
+                        "for-in requires an array or string, got {:?}",
+                        other
+                    ))
+                }
+            };
+            // `for (x in ...)` binds `var.x` each iteration (var. prefix;
+            // arg. stays function-only). Restore outer value afterwards.
+            let key = format!("var.{}", var);
+            let saved = environment.get(&key).cloned();
+            for item in items {
+                environment.insert(key.clone(), item);
+                match execute_block(body, environment)? {
+                    Flow::Normal => {}
+                    Flow::Break => break,
+                    Flow::Continue => {}
+                    Flow::Return(value) => {
+                        restore_saved(environment, &key, saved);
+                        return Ok(Flow::Return(value));
+                    }
+                }
+            }
+            restore_saved(environment, &key, saved);
+            Ok(Flow::Normal)
         }
     }
+}
 
-    Ok(())
+fn restore_saved(
+    environment: &mut HashMap<String, Value>,
+    key: &str,
+    saved: Option<Value>,
+) {
+    match saved {
+        Some(value) => {
+            environment.insert(key.to_string(), value);
+        }
+        None => {
+            environment.remove(key);
+        }
+    }
 }
 
 fn resolve_variable_name(name: &str, environment: &HashMap<String, Value>) -> Option<Value> {
@@ -952,8 +1155,18 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
             (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
             _ => Err("Division requires non-zero numbers".to_string()),
         },
-        BinaryOperator::Equal => Ok(Value::Logic(left == right)),
-        BinaryOperator::NotEqual => Ok(Value::Logic(left != right)),
+        BinaryOperator::Equal => match (&left, &right) {
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(a.eq_ignore_ascii_case(b))),
+            (Value::String(_), Value::Null) => Ok(Value::Logic(false)),
+            (Value::Null, Value::String(_)) => Ok(Value::Logic(false)),
+            _ => Ok(Value::Logic(left == right)),
+        },
+        BinaryOperator::NotEqual => match (&left, &right) {
+            (Value::String(a), Value::String(b)) => Ok(Value::Logic(!a.eq_ignore_ascii_case(b))),
+            _ => Ok(Value::Logic(left != right)),
+        },
+        BinaryOperator::StrictEqual => Ok(Value::Logic(left == right)),
+        BinaryOperator::StrictNotEqual => Ok(Value::Logic(left != right)),
         BinaryOperator::And => Ok(Value::Logic(is_truthy(&left) && is_truthy(&right))),
         BinaryOperator::Or => Ok(Value::Logic(is_truthy(&left) || is_truthy(&right))),
         BinaryOperator::Greater => match (left, right) {
@@ -1306,6 +1519,56 @@ mod tests {
             &program.statements[0],
             Statement::Event { object, name, .. } if object == "kal" && name == "OnStart"
         ));
+    }
+
+    #[test]
+    fn case_insensitive_and_sensitive_string_equality_work() {
+        let mut environment = HashMap::new();
+        environment.insert("var.name".to_string(), Value::String("Hello".to_string()));
+
+        let insensitive_equal = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.name".to_string())),
+                op: BinaryOperator::Equal,
+                right: Box::new(Value::String("hello".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(insensitive_equal, Value::Logic(true));
+
+        let sensitive_equal = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.name".to_string())),
+                op: BinaryOperator::StrictEqual,
+                right: Box::new(Value::String("hello".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(sensitive_equal, Value::Logic(false));
+
+        let insensitive_not_equal = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.name".to_string())),
+                op: BinaryOperator::NotEqual,
+                right: Box::new(Value::String("world".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(insensitive_not_equal, Value::Logic(true));
+
+        let sensitive_not_equal = resolve_value(
+            &Value::Binary {
+                left: Box::new(Value::Variable("var.name".to_string())),
+                op: BinaryOperator::StrictNotEqual,
+                right: Box::new(Value::String("Hello".to_string())),
+            },
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(sensitive_not_equal, Value::Logic(false));
     }
 
     #[test]
