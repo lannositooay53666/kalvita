@@ -24,9 +24,15 @@ var.hero.health = 50             // nested property/index assignment
 var.pair[0] = 99
 ```
 
-Types (`string number logic null array object function`) are documentation-only
-today. Redeclaring with `var local/global` overwrites (redeclare-as-assign).
-Reads require the `var.` prefix; bare names are `NameError`.
+Types (`string number logic null array object function`) are enforced at
+write time: declaring, redeclaring, or assigning a mismatched value is a
+catchable `TypeError` (`expected number for var.n, got string`). `null`
+fits every slot. Redeclaring with a new type resets the slot. Anything else
+as a type name is a parse error. Loop variables, `catch (var.err)`, and
+function params are untyped; array elements and object properties are
+unchecked (collections are unparameterized). Reads require the `var.`
+prefix; bare names are `NameError`. Redeclaring still overwrites values
+(redeclare-as-assign).
 
 ## 3. Functions
 

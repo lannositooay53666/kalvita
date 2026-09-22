@@ -1099,9 +1099,10 @@ impl Parser {
                 Ok("object".to_string())
             }
             Some(Token::Identifier(name)) => {
-                let name = name.clone();
-                self.index += 1;
-                Ok(name)
+                return Err(format!(
+                    "Expected type name (string, number, logic, null, array, object, function), found '{}'",
+                    name
+                ));
             }
             _ => Err(format!("Expected type name, found {:?}", self.peek())),
         }

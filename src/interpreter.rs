@@ -55,6 +55,7 @@ fn bind_params(
     defaults: &HashMap<String, Value>,
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
     function: &str,
@@ -62,10 +63,10 @@ fn bind_params(
 ) -> Result<(), RuntimeFault> {
     for (i, param) in params.iter().enumerate() {
         if let Some(arg) = args.get(i) {
-            let value = resolve_value(arg, environment, rt, cur)?;
+            let value = resolve_value(arg, environment, types, rt, cur)?;
             local_env.insert(format!("arg.{}", param), value);
         } else if let Some(default) = defaults.get(param) {
-            let value = resolve_value(default, environment, rt, cur)?;
+            let value = resolve_value(default, environment, types, rt, cur)?;
             local_env.insert(format!("arg.{}", param), value);
         } else {
             return Err(throw_err(
@@ -85,8 +86,10 @@ pub const ENTRY_ALIAS: &str = "__main__";
 struct LoadedModule {
     path: PathBuf,
     top_locals: HashMap<String, Value>,
+    top_local_types: HashMap<String, String>,
     globals: HashMap<String, Value>,
     global_names: HashSet<String>,
+    global_types: HashMap<String, String>,
     program: Option<Program>,
     onstart_executed: bool,
 }
@@ -96,8 +99,10 @@ impl LoadedModule {
         Self {
             path: PathBuf::new(),
             top_locals: HashMap::new(),
+            top_local_types: HashMap::new(),
             globals: HashMap::new(),
             global_names: HashSet::new(),
+            global_types: HashMap::new(),
             program: None,
             onstart_executed: false,
         }
@@ -165,17 +170,58 @@ impl ModuleRuntime {
         env
     }
 
+    /// Declared types merged the same way as values (locals shadow).
+    fn module_merged_types(&self, alias: &str) -> HashMap<String, String> {
+        let mut types = HashMap::new();
+        if let Some(m) = self.modules.get(alias) {
+            for name in &m.global_names {
+                if let Some(ty) = m.global_types.get(name) {
+                    types.insert(format!("var.{}", name), ty.clone());
+                }
+            }
+            for (k, v) in &m.top_local_types {
+                types.insert(k.clone(), v.clone());
+            }
+        }
+        types
+    }
+
+    fn lookup_type(&self, alias: &str, key: &str) -> Option<String> {
+        let short = key.strip_prefix("var.")?;
+        if self
+            .modules
+            .get(alias)
+            .map(|m| m.global_names.contains(short))
+            .unwrap_or(false)
+        {
+            self.modules
+                .get(alias)
+                .and_then(|m| m.global_types.get(short).cloned())
+        } else {
+            None
+        }
+    }
+
     /// Snapshot file-scope locals after top-level execution: every
     /// `var.*` entry that is not a declared global.
-    fn snapshot_top_locals(&mut self, alias: &str, env: &HashMap<String, Value>) {
+    fn snapshot_top_locals(
+        &mut self,
+        alias: &str,
+        env: &HashMap<String, Value>,
+        types: &HashMap<String, String>,
+    ) {
         self.ensure_module(alias);
         let global_names = self.modules[alias].global_names.clone();
         let module = self.modules.get_mut(alias).unwrap();
         module.top_locals.clear();
+        module.top_local_types.clear();
         for (k, v) in env {
             if let Some(short) = k.strip_prefix("var.") {
                 if !global_names.contains(short) {
                     module.top_locals.insert(k.clone(), v.clone());
+                    if let Some(ty) = types.get(k) {
+                        module.top_local_types.insert(k.clone(), ty.clone());
+                    }
                 }
             }
         }
@@ -240,6 +286,7 @@ pub fn run_source(source: &str, base_dir: &Path, label: &Path) -> Result<(), Str
 pub struct Repl {
     rt: ModuleRuntime,
     env: HashMap<String, Value>,
+    types: HashMap<String, String>,
     base_dir: PathBuf,
 }
 
@@ -248,6 +295,7 @@ impl Repl {
         Self {
             rt: ModuleRuntime::default(),
             env: HashMap::new(),
+            types: HashMap::new(),
             base_dir,
         }
     }
@@ -265,7 +313,7 @@ impl Repl {
             if matches!(stmt, Statement::Declare { .. }) {
                 continue;
             }
-            match execute_statement(stmt, &mut self.env, &mut self.rt, ENTRY_ALIAS) {
+            match execute_statement(stmt, &mut self.env, &mut self.types, &mut self.rt, ENTRY_ALIAS) {
                 Ok(Flow::Normal) => {}
                 Ok(Flow::Break) => return Err("break outside loop".to_string()),
                 Ok(Flow::Continue) => return Err("continue outside loop".to_string()),
@@ -276,7 +324,7 @@ impl Repl {
                 Err(RuntimeFault::Throw(err)) => return Err(uncaught_message(&err)),
             }
         }
-        self.rt.snapshot_top_locals(ENTRY_ALIAS, &self.env);
+        self.rt.snapshot_top_locals(ENTRY_ALIAS, &self.env, &self.types);
         Ok(())
     }
 }
@@ -296,11 +344,12 @@ fn execute_with_runtime(
     // Phase 2: run own top-level (declares are no-ops here).
     rt.ensure_module(alias);
     let mut environment: HashMap<String, Value> = HashMap::new();
+    let mut types: HashMap<String, String> = HashMap::new();
     for statement in &program.statements {
         if matches!(statement, Statement::Declare { .. }) {
             continue;
         }
-        match execute_statement(statement, &mut environment, rt, alias) {
+        match execute_statement(statement, &mut environment, &mut types, rt, alias) {
             Ok(Flow::Normal) => {}
             Ok(Flow::Break) => return Err("break outside loop".to_string()),
             Ok(Flow::Continue) => return Err("continue outside loop".to_string()),
@@ -311,7 +360,7 @@ fn execute_with_runtime(
             Err(RuntimeFault::Throw(err)) => return Err(uncaught_message(&err)),
         }
     }
-    rt.snapshot_top_locals(alias, &environment);
+    rt.snapshot_top_locals(alias, &environment, &types);
     Ok(())
 }
 
@@ -423,6 +472,7 @@ fn load_module(
     // Own top-level (declares skipped; events deferred to
     // run_module_onstart so `run=false` truly skips them).
     let mut env: HashMap<String, Value> = HashMap::new();
+    let mut env_types: HashMap<String, String> = HashMap::new();
     for stmt in &program.statements {
         if matches!(
             stmt,
@@ -430,7 +480,7 @@ fn load_module(
         ) {
             continue;
         }
-        match execute_statement(stmt, &mut env, rt, &alias) {
+        match execute_statement(stmt, &mut env, &mut env_types, rt, &alias) {
             Ok(Flow::Normal) => {}
             Ok(Flow::Break) => {
                 rt.loading.pop();
@@ -467,7 +517,7 @@ fn load_module(
             }
         }
     }
-    rt.snapshot_top_locals(&alias, &env);
+    rt.snapshot_top_locals(&alias, &env, &env_types);
     if run {
         run_module_onstart(rt, &alias)?;
     }
@@ -509,8 +559,9 @@ fn run_module_onstart(rt: &mut ModuleRuntime, alias: &str) -> Result<(), String>
         .map(|m| m.path.display().to_string())
         .unwrap_or_default();
     let mut env = rt.module_merged_env(alias);
+    let mut env_types = rt.module_merged_types(alias);
     for event in &events {
-        match execute_statement(event, &mut env, rt, alias) {
+        match execute_statement(event, &mut env, &mut env_types, rt, alias) {
             Ok(_) => {}
             Err(RuntimeFault::Fatal(msg)) => {
                 return Err(format!("Module error: '{}': {}", path_display, msg))
@@ -525,6 +576,8 @@ fn run_module_onstart(rt: &mut ModuleRuntime, alias: &str) -> Result<(), String>
         }
     }
     // Write back any globals touched by OnStart, refresh locals snapshot.
+    // (GlobalDecl and global assignment already write the live store;
+    // this only refreshes the locals snapshot. Types stay as declared.)
     if let Some(module) = rt.modules.get_mut(alias) {
         for name in module.global_names.clone() {
             let key = format!("var.{}", name);
@@ -533,7 +586,7 @@ fn run_module_onstart(rt: &mut ModuleRuntime, alias: &str) -> Result<(), String>
             }
         }
     }
-    rt.snapshot_top_locals(alias, &env);
+    rt.snapshot_top_locals(alias, &env, &env_types);
     if let Some(module) = rt.modules.get_mut(alias) {
         module.onstart_executed = true;
     }
@@ -543,11 +596,12 @@ fn run_module_onstart(rt: &mut ModuleRuntime, alias: &str) -> Result<(), String>
 fn execute_block(
     statements: &[Statement],
     environment: &mut HashMap<String, Value>,
+    types: &mut HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Flow, RuntimeFault> {
     for stmt in statements {
-        match execute_statement(stmt, environment, rt, cur)? {
+        match execute_statement(stmt, environment, types, rt, cur)? {
             Flow::Normal => {}
             other => return Ok(other),
         }
@@ -569,11 +623,12 @@ fn stringify_value(value: &Value) -> String {
 fn resolve_args(
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Vec<Value>, RuntimeFault> {
     args.iter()
-        .map(|arg| resolve_value(arg, environment, rt, cur))
+        .map(|arg| resolve_value(arg, environment, types, rt, cur))
         .collect()
 }
 
@@ -626,10 +681,11 @@ fn invoke_math(
     function: &str,
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Option<Value>, RuntimeFault> {
-    let resolved = resolve_args(args, environment, rt, cur)?;
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
     match function {
         "Sin" | "Cos" | "Tan" | "Sqrt" | "Floor" | "Ceil" | "Abs" => {
             let n = match resolved.as_slice() {
@@ -726,10 +782,11 @@ fn invoke_str(
     function: &str,
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Option<Value>, RuntimeFault> {
-    let resolved = resolve_args(args, environment, rt, cur)?;
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
     match function {
         "Len" => match resolved.as_slice() {
             [v] => Ok(Some(Value::Number(expect_string(v, "Len")?.chars().count() as f64))),
@@ -858,10 +915,11 @@ fn invoke_arr(
     function: &str,
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Option<Value>, RuntimeFault> {
-    let resolved = resolve_args(args, environment, rt, cur)?;
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
     match function {
         "Len" => match resolved.as_slice() {
             [v] => Ok(Some(Value::Number(expect_array(v, "Len")?.len() as f64))),
@@ -1017,6 +1075,7 @@ fn invoke_function(
     function: &str,
     args: &[Value],
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Option<Value>, RuntimeFault> {
@@ -1050,18 +1109,19 @@ fn invoke_function(
             } => {
                 let _guard = enter_call(rt)?;
                 let mut local_env = rt.module_merged_env(alias);
+                let mut local_types = rt.module_merged_types(alias);
                 let argument_array = Value::Array(
                     args.iter()
-                        .map(|arg| resolve_value(arg, environment, rt, cur))
+                        .map(|arg| resolve_value(arg, environment, types, rt, cur))
                         .collect::<Result<Vec<_>, RuntimeFault>>()?,
                 );
                 local_env.insert("pass".to_string(), Value::Null);
                 local_env.insert("arg".to_string(), argument_array.clone());
                 local_env.insert("args".to_string(), argument_array);
-                bind_params(&params, &defaults, args, environment, rt, cur, function, &mut local_env)?;
+                bind_params(&params, &defaults, args, environment, types, rt, cur, function, &mut local_env)?;
                 let mut result = None;
                 for stmt in body {
-                    match execute_statement(&stmt, &mut local_env, rt, alias)? {
+                    match execute_statement(&stmt, &mut local_env, &mut local_types, rt, alias)? {
                         Flow::Normal => {}
                         Flow::Break => {
                             return Err(fatal_err("break outside loop"));
@@ -1087,7 +1147,7 @@ fn invoke_function(
         Some(obj) if obj == "con" && function == "Print" => {
             let mut rendered = Vec::new();
             for arg in args {
-                let value = resolve_value(arg, environment, rt, cur)?;
+                let value = resolve_value(arg, environment, types, rt, cur)?;
                 rendered.push(format_value(value));
             }
             println!("{}", rendered.join(" "));
@@ -1096,7 +1156,7 @@ fn invoke_function(
         Some(obj) if obj == "con" && function == "Input" => {
             let prompt = match args {
                 [] => String::new(),
-                [arg] => match resolve_value(arg, environment, rt, cur)? {
+                [arg] => match resolve_value(arg, environment, types, rt, cur)? {
                     Value::String(s) => s,
                     other => format_value(other),
                 },
@@ -1119,9 +1179,9 @@ fn invoke_function(
                 line.trim_end_matches(&['\n', '\r'][..]).to_string(),
             )))
         }
-        Some(obj) if obj == "math" => invoke_math(function, args, environment, rt, cur),
-        Some(obj) if obj == "str" => invoke_str(function, args, environment, rt, cur),
-        Some(obj) if obj == "arr" => invoke_arr(function, args, environment, rt, cur),
+        Some(obj) if obj == "math" => invoke_math(function, args, environment, types, rt, cur),
+        Some(obj) if obj == "str" => invoke_str(function, args, environment, types, rt, cur),
+        Some(obj) if obj == "arr" => invoke_arr(function, args, environment, types, rt, cur),
         Some(obj) if obj == "time" => {
             if !args.is_empty() {
                 return Err(throw_err("ValueError", "Now expects no arguments"));
@@ -1145,7 +1205,7 @@ fn invoke_function(
         Some(obj) if obj == "file" => {
             let resolved: Vec<Value> = args
                 .iter()
-                .map(|arg| resolve_value(arg, environment, rt, cur))
+                .map(|arg| resolve_value(arg, environment, types, rt, cur))
                 .collect::<Result<Vec<_>, RuntimeFault>>()?;
             match function {
                 "Read" => {
@@ -1185,7 +1245,7 @@ fn invoke_function(
         }
         _ => {
             let passed_value = match object {
-                Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment, rt, cur)
+                Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment, types, rt, cur)
                     .or_else(|_| lookup_scoped(obj, environment, rt, cur).ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", obj))))?,
                 None => Value::Null,
             };
@@ -1195,13 +1255,13 @@ fn invoke_function(
                 || function.eq_ignore_ascii_case("CaseSensitiveEquals")
             {
                 let target = match object {
-                    Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment, rt, cur)
+                    Some(obj) => resolve_value(&Value::Variable(obj.to_string()), environment, types, rt, cur)
                         .or_else(|_| lookup_scoped(obj, environment, rt, cur).ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", obj))))?,
                     None => return Err(throw_err("ValueError", "case-sensitive equality requires a target value")),
                 };
 
                 let rhs = match args {
-                    [value] => resolve_value(value, environment, rt, cur)?,
+                    [value] => resolve_value(value, environment, types, rt, cur)?,
                     _ => return Err(throw_err("ValueError", "case-sensitive equality expects exactly one argument")),
                 };
 
@@ -1211,7 +1271,7 @@ fn invoke_function(
                 }
             }
 
-            let callee = resolve_value(&Value::Variable(function.to_string()), environment, rt, cur)
+            let callee = resolve_value(&Value::Variable(function.to_string()), environment, types, rt, cur)
                 .or_else(|_| {
                     lookup_scoped(function, environment, rt, cur).ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", function)))
                 })?;
@@ -1224,19 +1284,20 @@ fn invoke_function(
                 } => {
                     let _guard = enter_call(rt)?;
                     let mut local_env = environment.clone();
+                    let mut local_types = types.clone();
                     let argument_array = Value::Array(
                         args.iter()
-                            .map(|arg| resolve_value(arg, environment, rt, cur))
+                            .map(|arg| resolve_value(arg, environment, types, rt, cur))
                             .collect::<Result<Vec<_>, RuntimeFault>>()?,
                     );
                     local_env.insert("pass".to_string(), passed_value);
                     local_env.insert("arg".to_string(), argument_array.clone());
                     local_env.insert("args".to_string(), argument_array);
-                    bind_params(&params, &defaults, args, environment, rt, cur, function, &mut local_env)?;
+                    bind_params(&params, &defaults, args, environment, types, rt, cur, function, &mut local_env)?;
 
                     let mut result = None;
                     for stmt in body {
-                        match execute_statement(&stmt, &mut local_env, rt, cur)? {
+                        match execute_statement(&stmt, &mut local_env, &mut local_types, rt, cur)? {
                             Flow::Normal => {}
                             Flow::Break => {
                                 return Err(fatal_err("break outside loop"));
@@ -1259,40 +1320,99 @@ fn invoke_function(
     }
 }
 
+/// Enforce a declared slot type. `null` passes every type; anything else
+/// must match the discriminant. Mismatches are catchable `TypeError`s.
+fn check_type(slot: &str, type_name: &str, value: &Value) -> Result<(), RuntimeFault> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    let ok = match (type_name, value) {
+        ("string", Value::String(_)) => true,
+        ("number", Value::Number(_)) => true,
+        ("logic", Value::Logic(_)) => true,
+        ("null", Value::Null) => true,
+        ("array", Value::Array(_)) => true,
+        ("object", Value::Object(_)) => true,
+        ("function", Value::Function { .. }) => true,
+        _ => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(throw_err(
+            "TypeError",
+            format!(
+                "expected {} for var.{}, got {}",
+                type_name,
+                slot,
+                value_type_name(value)
+            ),
+        ))
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Logic(_) => "logic",
+        Value::Variable(_) => "variable",
+        Value::Object(_) => "object",
+        Value::Array(_) => "array",
+        Value::Index { .. } => "index",
+        Value::FunctionCall { .. } => "function-call",
+        Value::ModuleVar { .. } => "module-var",
+        Value::Binary { .. } => "expression",
+        Value::Property { .. } => "property",
+        Value::Unary { .. } => "expression",
+        Value::Function { .. } => "function",
+        Value::Error { .. } => "error",
+    }
+}
+
 fn execute_statement(
     statement: &Statement,
     environment: &mut HashMap<String, Value>,
+    types: &mut HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Flow, RuntimeFault> {
     match statement {
-        Statement::VariableDecl { name, value, .. } => {
+        Statement::VariableDecl { name, type_name, value } => {
             // Redeclare-as-assign: `var local x <type> = v` overwrites `var.x`
-            // if it already exists, otherwise creates it. Type is not enforced.
+            // if it already exists, otherwise creates it. Redeclare resets
+            // the recorded type; mismatched values are a catchable TypeError
+            // (`null` always passes).
             let resolved = match value {
                 Value::Function { .. } => value.clone(),
-                _ => resolve_value(value, environment, rt, cur)?,
+                _ => resolve_value(value, environment, types, rt, cur)?,
             };
+            check_type(name, type_name, &resolved)?;
             environment.insert(format!("var.{}", name), resolved);
+            types.insert(format!("var.{}", name), type_name.clone());
             Ok(Flow::Normal)
         }
         Statement::FunctionCall { object, module, function, args } => {
-            let _ = invoke_function(object.as_deref(), module.as_deref(), function, args, environment, rt, cur)?;
+            let _ = invoke_function(object.as_deref(), module.as_deref(), function, args, environment, types, rt, cur)?;
             Ok(Flow::Normal)
         }
-        Statement::GlobalDecl { name, value, .. } => {
+        Statement::GlobalDecl { name, type_name, value } => {
             // `var global x <type> = v` writes the live module table (and
-            // the local scope). Redeclare overwrites. Allowed in any block
-            // so module functions can mutate their own globals.
+            // the local scope). Redeclare overwrites + resets the type.
+            // Allowed in any block so module functions can mutate globals.
             let resolved = match value {
                 Value::Function { .. } => value.clone(),
-                _ => resolve_value(value, environment, rt, cur)?,
+                _ => resolve_value(value, environment, types, rt, cur)?,
             };
+            check_type(name, type_name, &resolved)?;
             environment.insert(format!("var.{}", name), resolved.clone());
+            types.insert(format!("var.{}", name), type_name.clone());
             rt.ensure_module(cur);
             let module = rt.modules.get_mut(cur).unwrap();
             module.globals.insert(format!("var.{}", name), resolved);
             module.global_names.insert(name.clone());
+            module.global_types.insert(name.clone(), type_name.clone());
             Ok(Flow::Normal)
         }
         Statement::Declare { .. } => {
@@ -1300,19 +1420,19 @@ fn execute_statement(
             Ok(Flow::Normal)
         }
         Statement::Assign { target, op, value } => {
-            let new_value = resolve_value(value, environment, rt, cur)?;
+            let new_value = resolve_value(value, environment, types, rt, cur)?;
             let final_value = match op {
                 None => {
                     // Plain `=` requires the target to exist (declare first).
-                    read_assign_target(target, environment, rt, cur)?;
+                    read_assign_target(target, environment, types, rt, cur)?;
                     new_value
                 }
                 Some(binop) => {
-                    let current = read_assign_target(target, environment, rt, cur)?;
+                    let current = read_assign_target(target, environment, types, rt, cur)?;
                     evaluate_binary(current, new_value, binop)?
                 }
             };
-            write_assign_target(target, final_value, environment, rt, cur)?;
+            write_assign_target(target, final_value, environment, types, rt, cur)?;
             Ok(Flow::Normal)
         }
         Statement::Switch {
@@ -1320,36 +1440,36 @@ fn execute_statement(
             cases,
             default,
         } => {
-            let subject = resolve_value(scrutinee, environment, rt, cur)?;
+            let subject = resolve_value(scrutinee, environment, types, rt, cur)?;
             for (case_value, body) in cases {
-                let expected = resolve_value(case_value, environment, rt, cur)?;
+                let expected = resolve_value(case_value, environment, types, rt, cur)?;
                 if values_strict_equal(&subject, &expected) {
-                    return execute_block(body, environment, rt, cur);
+                    return execute_block(body, environment, types, rt, cur);
                 }
             }
             if let Some(default_body) = default {
-                return execute_block(default_body, environment, rt, cur);
+                return execute_block(default_body, environment, types, rt, cur);
             }
             Ok(Flow::Normal)
         }
         Statement::Return { value } => {
-            let resolved = resolve_value(value, environment, rt, cur)?;
+            let resolved = resolve_value(value, environment, types, rt, cur)?;
             Ok(Flow::Return(resolved))
         }
         Statement::Break => Ok(Flow::Break),
         Statement::Continue => Ok(Flow::Continue),
         Statement::Throw { error_type, message } => {
-            let resolved_msg = resolve_value(message, environment, rt, cur)?;
+            let resolved_msg = resolve_value(message, environment, types, rt, cur)?;
             let text = match resolved_msg {
                 Value::String(s) => s,
                 other => format_value(other),
             };
             Err(throw_err(error_type, text))
         }
-        Statement::Try { body, catches } => execute_try(body, catches, environment, rt, cur),
+        Statement::Try { body, catches } => execute_try(body, catches, environment, types, rt, cur),
         Statement::Event { object, name, body } => {
             if object == "kal" && name == "OnStart" {
-                match execute_block(body, environment, rt, cur)? {
+                match execute_block(body, environment, types, rt, cur)? {
                     Flow::Normal => Ok(Flow::Normal),
                     Flow::Break => Err(fatal_err("break outside loop")),
                     Flow::Continue => Err(fatal_err("continue outside loop")),
@@ -1367,30 +1487,30 @@ fn execute_statement(
             else_if_branches,
             else_branch,
         } => {
-            let condition_value = resolve_value(condition, environment, rt, cur)?;
+            let condition_value = resolve_value(condition, environment, types, rt, cur)?;
             if is_truthy(&condition_value) {
-                return execute_block(then_branch, environment, rt, cur);
+                return execute_block(then_branch, environment, types, rt, cur);
             }
 
             for (else_if_condition, else_if_body) in else_if_branches {
-                let branch_value = resolve_value(else_if_condition, environment, rt, cur)?;
+                let branch_value = resolve_value(else_if_condition, environment, types, rt, cur)?;
                 if is_truthy(&branch_value) {
-                    return execute_block(else_if_body, environment, rt, cur);
+                    return execute_block(else_if_body, environment, types, rt, cur);
                 }
             }
 
             if let Some(else_body) = else_branch {
-                return execute_block(else_body, environment, rt, cur);
+                return execute_block(else_body, environment, types, rt, cur);
             }
             Ok(Flow::Normal)
         }
         Statement::While { condition, body } => {
             for _ in 0..MAX_LOOP_ITERS {
-                let condition_value = resolve_value(condition, environment, rt, cur)?;
+                let condition_value = resolve_value(condition, environment, types, rt, cur)?;
                 if !is_truthy(&condition_value) {
                     return Ok(Flow::Normal);
                 }
-                match execute_block(body, environment, rt, cur)? {
+                match execute_block(body, environment, types, rt, cur)? {
                     Flow::Normal => {}
                     Flow::Break => return Ok(Flow::Normal),
                     Flow::Continue => {}
@@ -1408,7 +1528,7 @@ fn execute_statement(
                 right,
             } = iterable
             {
-                let start = match resolve_value(left, environment, rt, cur)? {
+                let start = match resolve_value(left, environment, types, rt, cur)? {
                     Value::Number(n) => as_i64(n)?,
                     other => {
                         return Err(throw_err(
@@ -1417,7 +1537,7 @@ fn execute_statement(
                         ))
                     }
                 };
-                let end = match resolve_value(right, environment, rt, cur)? {
+                let end = match resolve_value(right, environment, types, rt, cur)? {
                     Value::Number(n) => as_i64(n)?,
                     other => {
                         return Err(throw_err(
@@ -1446,7 +1566,7 @@ fn execute_statement(
                             .globals
                             .insert(key.clone(), item);
                     }
-                    match execute_block(body, environment, rt, cur)? {
+                    match execute_block(body, environment, types, rt, cur)? {
                         Flow::Normal => {}
                         Flow::Break => break,
                         Flow::Continue => {}
@@ -1462,7 +1582,7 @@ fn execute_statement(
                 restore_global(rt, cur, &key, saved_global);
                 return Ok(Flow::Normal);
             }
-            let resolved_iterable = resolve_value(iterable, environment, rt, cur)?;
+            let resolved_iterable = resolve_value(iterable, environment, types, rt, cur)?;
             let items: Vec<Value> = match resolved_iterable {
                 Value::Array(items) => items,
                 Value::String(s) => s.chars().map(|ch| Value::String(ch.to_string())).collect(),
@@ -1495,7 +1615,7 @@ fn execute_statement(
                         .globals
                         .insert(key.clone(), item);
                 }
-                match execute_block(body, environment, rt, cur)? {
+                match execute_block(body, environment, types, rt, cur)? {
                     Flow::Normal => {}
                     Flow::Break => break,
                     Flow::Continue => {}
@@ -1517,10 +1637,11 @@ fn execute_try(
     body: &[Statement],
     catches: &[CatchClause],
     environment: &mut HashMap<String, Value>,
+    types: &mut HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Flow, RuntimeFault> {
-    match execute_block(body, environment, rt, cur) {
+    match execute_block(body, environment, types, rt, cur) {
         Ok(flow) => Ok(flow),
         Err(RuntimeFault::Throw(err_value)) => {
             let thrown_type = match &err_value {
@@ -1551,7 +1672,7 @@ fn execute_try(
                             .globals
                             .insert(key.clone(), err_value);
                     }
-                    let result = execute_block(&catch.body, environment, rt, cur);
+                    let result = execute_block(&catch.body, environment, types, rt, cur);
                     restore_saved(environment, &key, saved);
                     restore_global(rt, cur, &key, saved_global);
                     result
@@ -1615,6 +1736,7 @@ fn values_strict_equal(a: &Value, b: &Value) -> bool {
 fn read_assign_target(
     target: &AssignTarget,
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Value, RuntimeFault> {
@@ -1626,7 +1748,7 @@ fn read_assign_target(
             )
         }),
         AssignTarget::Property { target: inner, key } => {
-            let container = read_assign_target(inner, environment, rt, cur)?;
+            let container = read_assign_target(inner, environment, types, rt, cur)?;
             match container {
                 Value::Object(map) => map.get(key).cloned().ok_or_else(|| {
                     throw_err("NameError", format!("Unknown property: {}", key))
@@ -1638,8 +1760,8 @@ fn read_assign_target(
             }
         }
         AssignTarget::Index { target: inner, index } => {
-            let container = read_assign_target(inner, environment, rt, cur)?;
-            let idx_value = resolve_value(index, environment, rt, cur)?;
+            let container = read_assign_target(inner, environment, types, rt, cur)?;
+            let idx_value = resolve_value(index, environment, types, rt, cur)?;
             let idx = match idx_value {
                 Value::Number(n)
                     if n.is_finite() && n.fract() == 0.0 && n >= 0.0 =>
@@ -1679,6 +1801,7 @@ fn write_assign_target(
     target: &AssignTarget,
     new_value: Value,
     environment: &mut HashMap<String, Value>,
+    types: &mut HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<(), RuntimeFault> {
@@ -1690,6 +1813,14 @@ fn write_assign_target(
                     "NameError",
                     format!("Cannot assign to undeclared variable: var.{}", name),
                 ));
+            }
+            // Enforce the slot's declared type (if any).
+            if let Some(declared) = types
+                .get(&key)
+                .cloned()
+                .or_else(|| rt.lookup_type(cur, &key))
+            {
+                check_type(name, &declared, &new_value)?;
             }
             environment.insert(key.clone(), new_value.clone());
             if rt.is_global(cur, name) {
@@ -1703,7 +1834,7 @@ fn write_assign_target(
             Ok(())
         }
         AssignTarget::Property { target: inner, key } => {
-            let mut container = read_assign_target(inner, environment, rt, cur)?;
+            let mut container = read_assign_target(inner, environment, types, rt, cur)?;
             match &mut container {
                 Value::Object(map) => {
                     map.insert(key.clone(), new_value);
@@ -1715,10 +1846,10 @@ fn write_assign_target(
                     ))
                 }
             }
-            write_assign_target(inner, container, environment, rt, cur)
+            write_assign_target(inner, container, environment, types, rt, cur)
         }
         AssignTarget::Index { target: inner, index } => {
-            let idx_value = resolve_value(index, environment, rt, cur)?;
+            let idx_value = resolve_value(index, environment, types, rt, cur)?;
             let idx = match idx_value {
                 Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
                 _ => {
@@ -1728,7 +1859,7 @@ fn write_assign_target(
                     ))
                 }
             };
-            let mut container = read_assign_target(inner, environment, rt, cur)?;
+            let mut container = read_assign_target(inner, environment, types, rt, cur)?;
             match &mut container {
                 Value::Array(items) => {
                     if idx >= items.len() {
@@ -1752,7 +1883,7 @@ fn write_assign_target(
                     ))
                 }
             }
-            write_assign_target(inner, container, environment, rt, cur)
+            write_assign_target(inner, container, environment, types, rt, cur)
         }
     }
 }
@@ -1801,6 +1932,7 @@ fn resolve_variable_name(
 fn resolve_value(
     value: &Value,
     environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
     rt: &mut ModuleRuntime,
     cur: &str,
 ) -> Result<Value, RuntimeFault> {
@@ -1820,7 +1952,7 @@ fn resolve_value(
             })
         }
         Value::FunctionCall { object, module, function, args } => {
-            let result = invoke_function(object.as_deref(), module.as_deref(), function, args, environment, rt, cur)?;
+            let result = invoke_function(object.as_deref(), module.as_deref(), function, args, environment, types, rt, cur)?;
             match result {
                 Some(value) => Ok(value),
                 None => Ok(Value::Null),
@@ -1829,18 +1961,18 @@ fn resolve_value(
         Value::Array(items) => Ok(Value::Array(
             items
                 .iter()
-                .map(|item| resolve_value(item, environment, rt, cur))
+                .map(|item| resolve_value(item, environment, types, rt, cur))
                 .collect::<Result<Vec<_>, RuntimeFault>>()?,
         )),
         Value::Object(map) => {
             let mut resolved = HashMap::new();
             for (key, item) in map {
-                resolved.insert(key.clone(), resolve_value(item, environment, rt, cur)?);
+                resolved.insert(key.clone(), resolve_value(item, environment, types, rt, cur)?);
             }
             Ok(Value::Object(resolved))
         }
         Value::Property { target, key } => {
-            let target_value = resolve_value(target, environment, rt, cur)?;
+            let target_value = resolve_value(target, environment, types, rt, cur)?;
             match target_value {
                 Value::Object(map) => map.get(key).cloned().ok_or_else(|| throw_err("NameError", format!("Unknown property: {}", key))),
                 Value::Error { error_type, message } => match key.as_str() {
@@ -1853,8 +1985,8 @@ fn resolve_value(
             }
         }
         Value::Index { target, index } => {
-            let target_value = resolve_value(target, environment, rt, cur)?;
-            let index_value = resolve_value(index, environment, rt, cur)?;
+            let target_value = resolve_value(target, environment, types, rt, cur)?;
+            let index_value = resolve_value(index, environment, types, rt, cur)?;
             let idx = match index_value {
                 Value::Number(n) => {
                     if !n.is_finite() || n.fract() != 0.0 || n < 0.0 {
@@ -1890,12 +2022,12 @@ fn resolve_value(
             }
         }
         Value::Binary { left, op, right } => {
-            let left_value = resolve_value(left, environment, rt, cur)?;
-            let right_value = resolve_value(right, environment, rt, cur)?;
+            let left_value = resolve_value(left, environment, types, rt, cur)?;
+            let right_value = resolve_value(right, environment, types, rt, cur)?;
             evaluate_binary(left_value, right_value, op)
         }
         Value::Unary { op, value } => {
-            let inner = resolve_value(value, environment, rt, cur)?;
+            let inner = resolve_value(value, environment, types, rt, cur)?;
             evaluate_unary(inner, op)
         }
         _ => Ok(value.clone()),
@@ -2205,7 +2337,7 @@ mod tests {
 
     fn eval(value: &Value, env: &HashMap<String, Value>) -> Result<Value, RuntimeFault> {
         let mut rt = ModuleRuntime::default();
-        resolve_value(value, env, &mut rt, TEST_ALIAS)
+        resolve_value(value, env, &HashMap::new(), &mut rt, TEST_ALIAS)
     }
 
     fn call(
@@ -2215,7 +2347,31 @@ mod tests {
         env: &HashMap<String, Value>,
     ) -> Result<Option<Value>, RuntimeFault> {
         let mut rt = ModuleRuntime::default();
-        invoke_function(object, None, function, args, env, &mut rt, TEST_ALIAS)
+        invoke_function(object, None, function, args, env, &HashMap::new(), &mut rt, TEST_ALIAS)
+    }
+
+    fn run_stmt(stmt: &Statement, env: &mut HashMap<String, Value>) {
+        execute_statement(
+            stmt,
+            env,
+            &mut HashMap::new(),
+            &mut ModuleRuntime::default(),
+            TEST_ALIAS,
+        )
+        .unwrap();
+    }
+
+    fn try_stmt(
+        stmt: &Statement,
+        env: &mut HashMap<String, Value>,
+    ) -> Result<Flow, RuntimeFault> {
+        execute_statement(
+            stmt,
+            env,
+            &mut HashMap::new(),
+            &mut ModuleRuntime::default(),
+            TEST_ALIAS,
+        )
     }
 
     #[test]
@@ -2290,8 +2446,8 @@ mod tests {
             value: Value::Number(15.0),
         };
 
-        execute_statement(&first, &mut environment, &mut ModuleRuntime::default(), TEST_ALIAS).unwrap();
-        execute_statement(&second, &mut environment, &mut ModuleRuntime::default(), TEST_ALIAS).unwrap();
+        run_stmt(&first, &mut environment);
+        run_stmt(&second, &mut environment);
 
         assert_eq!(environment.get("var.score"), Some(&Value::Number(15.0)));
     }
@@ -2657,9 +2813,8 @@ mod tests {
                 Statement::Event { body, .. } => body.clone(),
                 _ => panic!("expected event"),
             };
-            let mut rt = ModuleRuntime::default();
             let mut env = HashMap::new();
-            execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(&body[0], &mut env);
             assert_eq!(
                 env.get("var.r"),
                 Some(&Value::Number(expected)),
@@ -2727,9 +2882,8 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
-        execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS).unwrap();
+        run_stmt(&body[0], &mut env);
         assert_eq!(env.get("var.r"), Some(&Value::Logic(false)));
     }
 
@@ -2741,10 +2895,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         for stmt in &body {
-            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(stmt, &mut env);
         }
         assert_eq!(env.get("var.x"), Some(&Value::Number(40.0)));
         assert_eq!(
@@ -2771,10 +2924,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         assert!(matches!(
-            execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS),
+            try_stmt(&body[0], &mut env),
             Err(RuntimeFault::Throw(Value::Error { error_type, .. })) if error_type == "NameError"
         ));
     }
@@ -2793,6 +2945,7 @@ mod tests {
                 index: Box::new(Value::Number(1.9)),
             },
             &env,
+            &HashMap::new(),
             &mut rt,
             TEST_ALIAS,
         )
@@ -2816,11 +2969,10 @@ mod tests {
                 Statement::Event { body, .. } => body.clone(),
                 _ => panic!("expected event"),
             };
-            let mut rt = ModuleRuntime::default();
             let mut env = HashMap::new();
             env.insert("var.v".to_string(), value);
             for stmt in &body {
-                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+                run_stmt(stmt, &mut env);
             }
             assert_eq!(
                 env.get("var.r"),
@@ -2837,10 +2989,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         for stmt in &body {
-            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(stmt, &mut env);
         }
         assert_eq!(env.get("var.total"), Some(&Value::Number(10.0)));
         // Bare range as a value is a TypeError outside for-in.
@@ -2866,10 +3017,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         for stmt in &body {
-            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(stmt, &mut env);
         }
         assert_eq!(
             env.get("var.msg"),
@@ -2885,10 +3035,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         for stmt in &body {
-            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(stmt, &mut env);
         }
         assert_eq!(
             env.get("var.a"),
@@ -2902,13 +3051,10 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         let mut failed = false;
         for stmt in &body {
-            if let Err(RuntimeFault::Throw(_)) =
-                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS)
-            {
+            if try_stmt(stmt, &mut env).is_err() {
                 failed = true;
             }
         }
@@ -2923,13 +3069,10 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         let mut saw_fatal = false;
         for stmt in &body {
-            if let Err(RuntimeFault::Fatal(_)) =
-                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS)
-            {
+            if let Err(RuntimeFault::Fatal(_)) = try_stmt(stmt, &mut env) {
                 saw_fatal = true;
             }
         }
@@ -2944,10 +3087,9 @@ mod tests {
             Statement::Event { body, .. } => body.clone(),
             _ => panic!("expected event"),
         };
-        let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
         for stmt in &body {
-            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            run_stmt(stmt, &mut env);
         }
         assert_eq!(env.get("var.a"), Some(&Value::String("HEY".to_string())));
         assert_eq!(env.get("var.c"), Some(&Value::Number(2.0)));
@@ -3030,6 +3172,7 @@ mod tests {
             LoadedModule {
                 path: PathBuf::from("math.kal"),
                 top_locals: HashMap::new(),
+                top_local_types: HashMap::new(),
                 globals: HashMap::from([
                     ("var.share".to_string(), Value::Number(53.0)),
                     (
@@ -3048,6 +3191,10 @@ mod tests {
                     ),
                 ]),
                 global_names: HashSet::from(["share".to_string(), "double".to_string()]),
+                global_types: HashMap::from([
+                    ("share".to_string(), "number".to_string()),
+                    ("double".to_string(), "function".to_string()),
+                ]),
                 program: None,
                 onstart_executed: true,
             },
@@ -3065,6 +3212,7 @@ mod tests {
                 name: "share".to_string(),
             },
             &env,
+            &HashMap::new(),
             &mut rt,
             TEST_ALIAS,
         )
@@ -3082,6 +3230,7 @@ mod tests {
                 name: "share".to_string(),
             },
             &env,
+            &HashMap::new(),
             &mut rt,
             TEST_ALIAS,
         )
@@ -3104,6 +3253,7 @@ mod tests {
                 args: vec![Value::Number(21.0)],
             },
             &env,
+            &HashMap::new(),
             &mut rt,
             TEST_ALIAS,
         )
@@ -3115,18 +3265,20 @@ mod tests {
     fn global_decl_writes_live_store_and_local_reads_win() {
         let mut rt = ModuleRuntime::default();
         let mut env = HashMap::new();
+        let mut types = HashMap::new();
         let decl = Statement::GlobalDecl {
             name: "share".to_string(),
             type_name: "number".to_string(),
             value: Value::Number(53.0),
         };
-        execute_statement(&decl, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        execute_statement(&decl, &mut env, &mut types, &mut rt, TEST_ALIAS).unwrap();
         // Live store read.
         let via_store = resolve_value(
             &Value::ModuleVar {
                 alias: TEST_ALIAS.to_string(),
                 name: "share".to_string(),
             },
+            &HashMap::new(),
             &HashMap::new(),
             &mut rt,
             TEST_ALIAS,
@@ -3137,6 +3289,7 @@ mod tests {
         let via_plain = resolve_value(
             &Value::Variable("var.share".to_string()),
             &env,
+            &types,
             &mut rt,
             TEST_ALIAS,
         )
@@ -3148,14 +3301,116 @@ mod tests {
             type_name: "number".to_string(),
             value: Value::Number(99.0),
         };
-        execute_statement(&redecl, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        execute_statement(&redecl, &mut env, &mut types, &mut rt, TEST_ALIAS).unwrap();
         let updated = resolve_value(
             &Value::Variable("var.share".to_string()),
             &env,
+            &types,
             &mut rt,
             TEST_ALIAS,
         )
         .unwrap();
         assert_eq!(updated, Value::Number(99.0));
+    }
+
+    #[test]
+    fn unknown_type_names_are_rejected() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local x banana = 1\n}\n";
+        assert!(Parser::parse(source).is_err());
+    }
+
+    fn run_with_types(source: &str) -> (HashMap<String, Value>, Option<String>) {
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        let mut types = HashMap::new();
+        for stmt in &body {
+            match execute_statement(stmt, &mut env, &mut types, &mut rt, TEST_ALIAS) {
+                Ok(_) => {}
+                Err(RuntimeFault::Fatal(msg)) => return (env, Some(format!("fatal: {}", msg))),
+                Err(RuntimeFault::Throw(Value::Error { error_type, message })) => {
+                    return (env, Some(format!("{}: {}", error_type, message)))
+                }
+                Err(RuntimeFault::Throw(other)) => return (env, Some(format!("throw: {:?}", other))),
+            }
+        }
+        (env, None)
+    }
+
+    #[test]
+    fn mismatched_declaration_is_type_error() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local n number = \"huh\"\n}\n";
+        let (_, err) = run_with_types(source);
+        let err = err.expect("should fail");
+        assert!(err.starts_with("TypeError"), "got: {}", err);
+        // Same via try/catch in-language.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    try {\n        var local n number = \"huh\"\n        catch (TypeError) {\n            var local caught string = var.err.message\n        }\n    }\n    con.Print(var.caught)\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert!(matches!(env.get("var.caught"), Some(Value::String(_))));
+    }
+
+    #[test]
+    fn all_seven_types_accept_and_reject() {
+        let good = vec![
+            ("string", "\"s\""),
+            ("number", "1"),
+            ("logic", "true"),
+            ("null", "null"),
+            ("array", "[1]"),
+            ("object", "{ a: 1 }"),
+            ("function", "(x) { return(arg.x) }"),
+        ];
+        for (ty, expr) in good {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local v {} = {}\n}}\n",
+                ty, expr
+            );
+            let (_, err) = run_with_types(&source);
+            assert!(err.is_none(), "{} = {} failed: {:?}", ty, expr, err);
+        }
+        let bad = vec![
+            ("string", "1"),
+            ("number", "\"s\""),
+            ("logic", "1"),
+            ("array", "{ a: 1 }"),
+            ("object", "[1]"),
+            ("function", "1"),
+        ];
+        for (ty, expr) in bad {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local v {} = {}\n}}\n",
+                ty, expr
+            );
+            let (_, err) = run_with_types(&source);
+            let err = err.expect("should fail");
+            assert!(err.starts_with("TypeError"), "{} = {}: got {}", ty, expr, err);
+        }
+    }
+
+    #[test]
+    fn null_passes_every_type_and_redeclare_resets() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local s string = null\n    var local n number = 1\n    var local n string = \"now a string\"\n    var local n number = 2\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(env.get("var.s"), Some(&Value::Null));
+        assert_eq!(env.get("var.n"), Some(&Value::Number(2.0)));
+    }
+
+    #[test]
+    fn assign_and_compound_respect_slot_types() {
+        // Plain assign of wrong type fails; compound result is checked too.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local x number = 1\n    var.x = \"s\"\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("TypeError"));
+        // Index assign into a number slot fails (root must stay consistent).
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local xs array = [1]\n    var local xs number = 5\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "redeclare resets: {:?}", err);
+        assert_eq!(env.get("var.xs"), Some(&Value::Number(5.0)));
     }
 }
