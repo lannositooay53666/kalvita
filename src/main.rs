@@ -1,3 +1,5 @@
+mod error;
+mod interpreter;
 mod lexer;
 mod parser;
 
@@ -89,7 +91,7 @@ fn cmd_run(path: &str, debug_tokens: bool, debug_ast: bool) {
             }
         }
     }
-    if let Err(err) = parser::run_file(Path::new(path)) {
+    if let Err(err) = interpreter::run_file(Path::new(path)) {
         print_runtime_error(&err);
     }
 }
@@ -295,7 +297,7 @@ fn cmd_repl() {
     use std::io::{BufRead, Write};
     println!("kalvita repl — :help for commands, :quit to exit");
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut session = parser::Repl::new(cwd);
+    let mut session = interpreter::Repl::new(cwd);
     let stdin = std::io::stdin();
     let mut buffer = String::new();
     print!("kal> ");
@@ -320,7 +322,7 @@ fn cmd_repl() {
                 ":clear" => {
                     let cwd =
                         env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                    session = parser::Repl::new(cwd);
+                    session = interpreter::Repl::new(cwd);
                     println!("cleared");
                     print!("kal> ");
                     let _ = std::io::stdout().flush();
