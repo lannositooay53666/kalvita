@@ -1,7 +1,9 @@
 use crate::lexer::{Lexer, Token};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum BinaryOperator {
@@ -9,6 +11,12 @@ pub enum BinaryOperator {
     Subtract,
     Multiply,
     Divide,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Range,
     Equal,
     NotEqual,
     StrictEqual,
@@ -24,6 +32,7 @@ pub enum BinaryOperator {
 #[derive(Debug, PartialEq, Clone)]
 pub enum UnaryOperator {
     Not,
+    BitNot,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -64,6 +73,7 @@ pub enum Value {
     },
     Function {
         params: Vec<String>,
+        defaults: HashMap<String, Value>,
         body: Vec<Statement>,
     },
     Error {
@@ -96,6 +106,16 @@ pub enum Statement {
     },
     Return {
         value: Box<Value>,
+    },
+    Assign {
+        target: AssignTarget,
+        op: Option<BinaryOperator>,
+        value: Box<Value>,
+    },
+    Switch {
+        scrutinee: Box<Value>,
+        cases: Vec<(Value, Vec<Statement>)>,
+        default: Option<Vec<Statement>>,
     },
     Event {
         object: String,
@@ -133,6 +153,14 @@ pub enum Statement {
 pub struct CatchClause {
     pub error_type: String,
     pub body: Vec<Statement>,
+}
+
+/// Assignment target: `var.x`, `var.obj.key`, `var.arr[i]` (chains nest).
+#[derive(Debug, PartialEq, Clone)]
+pub enum AssignTarget {
+    Var(String),
+    Property { target: Box<AssignTarget>, key: String },
+    Index { target: Box<AssignTarget>, index: Box<Value> },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -190,7 +218,13 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, String> {
         match self.peek() {
-            Some(Token::Var) => self.parse_variable_decl(),
+            Some(Token::Var) => {
+                match self.tokens.get(self.index + 1) {
+                    Some(Token::Local) | Some(Token::Global) => self.parse_variable_decl(),
+                    _ => self.parse_assign_statement(),
+                }
+            }
+            Some(Token::Switch) => self.parse_switch_statement(),
             Some(Token::Return) => self.parse_return_statement(),
             Some(Token::Declare) => self.parse_declare_statement(),
             Some(Token::If) => self.parse_if_statement(),
@@ -390,10 +424,19 @@ impl Parser {
         let name = self.consume_identifier()?;
         let type_name = self.consume_type_name()?;
         self.expect(Token::Assign)?;
-        let value = if self.matches(Token::LParen) {
-            self.parse_function_literal()?
-        } else {
-            self.parse_value()?
+        // `(params) { body }` is a function literal, but `(expr)` is a
+        // parenthesized value — disambiguate with lookahead for `{`.
+        let value = match self.try_function_header() {
+            Some((params, defaults, end)) => {
+                self.index = end;
+                let body = self.parse_block_contents()?;
+                Value::Function {
+                    params,
+                    defaults,
+                    body,
+                }
+            }
+            None => self.parse_value()?,
         };
         if is_global {
             Ok(Statement::GlobalDecl {
@@ -442,26 +485,134 @@ impl Parser {
         Ok(Statement::Declare { path, run })
     }
 
-    fn parse_function_literal(&mut self) -> Result<Value, String> {
-        self.expect(Token::LParen)?;
-        let params = self.parse_parameter_list()?;
-        self.expect(Token::RParen)?;
-        self.expect(Token::LBrace)?;
-        let body = self.parse_block_contents()?;
-        Ok(Value::Function { params, body })
+    fn parse_assign_statement(&mut self) -> Result<Statement, String> {
+        // `var.x = v`, `var.x += v`, `var.arr[i] = v`, `var.obj.k -= v`.
+        // Plain `=` requires the name to exist; compound ops read then write.
+        self.expect(Token::Var)?;
+        self.expect(Token::Dot)?;
+        let name = self.consume_identifier()?;
+        let mut target = AssignTarget::Var(name);
+        loop {
+            if self.matches(Token::Dot) {
+                self.expect(Token::Dot)?;
+                let key = self.consume_identifier()?;
+                target = AssignTarget::Property {
+                    target: Box::new(target),
+                    key,
+                };
+            } else if self.matches(Token::LBracket) {
+                self.expect(Token::LBracket)?;
+                let index = self.parse_expression()?;
+                self.expect(Token::RBracket)?;
+                target = AssignTarget::Index {
+                    target: Box::new(target),
+                    index: Box::new(index),
+                };
+            } else {
+                break;
+            }
+        }
+        let op = if self.match_token(Token::Assign) {
+            None
+        } else if self.match_token(Token::PlusAssign) {
+            Some(BinaryOperator::Add)
+        } else if self.match_token(Token::MinusAssign) {
+            Some(BinaryOperator::Subtract)
+        } else if self.match_token(Token::StarAssign) {
+            Some(BinaryOperator::Multiply)
+        } else if self.match_token(Token::SlashAssign) {
+            Some(BinaryOperator::Divide)
+        } else {
+            return Err(format!("Expected assignment operator, found {:?}", self.peek()));
+        };
+        let value = self.parse_expression()?;
+        Ok(Statement::Assign {
+            target,
+            op,
+            value: Box::new(value),
+        })
     }
 
-    fn parse_parameter_list(&mut self) -> Result<Vec<String>, String> {
+    fn parse_switch_statement(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Switch)?;
+        self.expect(Token::LParen)?;
+        let scrutinee = self.parse_expression()?;
+        self.expect(Token::RParen)?;
+        self.expect(Token::LBrace)?;
+        let mut cases = Vec::new();
+        let mut default = None;
+        while !matches!(self.peek(), Some(Token::RBrace) | Some(Token::Eof)) {
+            if self.match_token(Token::Case) {
+                self.expect(Token::LParen)?;
+                let value = self.parse_expression()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::LBrace)?;
+                let body = self.parse_block_contents()?;
+                cases.push((value, body));
+            } else if self.match_token(Token::Default) {
+                if default.is_some() {
+                    return Err("switch allows only one default block".to_string());
+                }
+                self.expect(Token::LBrace)?;
+                default = Some(self.parse_block_contents()?);
+            } else {
+                return Err(format!(
+                    "Expected case or default in switch, found {:?}",
+                    self.peek()
+                ));
+            }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Statement::Switch {
+            scrutinee: Box::new(scrutinee),
+            cases,
+            default,
+        })
+    }
+
+    /// Lookahead: `(params) {` → function header. Returns params,
+    /// defaults, and the index just past `{`. Runs on cloned tokens so a
+    /// failed probe (e.g. `(0 - 8) >> 2`) leaves the parser untouched.
+    fn try_function_header(&self) -> Option<(Vec<String>, HashMap<String, Value>, usize)> {
+        let mut trial = Parser {
+            tokens: self.tokens.clone(),
+            index: self.index,
+        };
+        let parsed = (|| -> Result<(Vec<String>, HashMap<String, Value>, usize), String> {
+            trial.expect(Token::LParen)?;
+            let (params, defaults) = trial.parse_parameter_list()?;
+            trial.expect(Token::RParen)?;
+            trial.expect(Token::LBrace)?;
+            Ok((params, defaults, trial.index))
+        })();
+        parsed.ok()
+    }
+
+    fn parse_parameter_list(&mut self) -> Result<(Vec<String>, HashMap<String, Value>), String> {
         let mut params = Vec::new();
+        let mut defaults = HashMap::new();
         if !matches!(self.peek(), Some(Token::RParen)) {
             loop {
-                params.push(self.consume_identifier()?);
+                let name = self.consume_identifier()?;
+                if self.match_token(Token::Assign) {
+                    let default = self.parse_expression()?;
+                    defaults.insert(name.clone(), default);
+                    params.push(name);
+                } else {
+                    if !defaults.is_empty() {
+                        return Err(format!(
+                            "Required parameter '{}' must come before defaulted parameters",
+                            name
+                        ));
+                    }
+                    params.push(name);
+                }
                 if !self.match_token(Token::Comma) {
                     break;
                 }
             }
         }
-        Ok(params)
+        Ok((params, defaults))
     }
 
     fn parse_block_contents(&mut self) -> Result<Vec<Statement>, String> {
@@ -512,13 +663,55 @@ impl Parser {
     }
 
     fn parse_and(&mut self) -> Result<Value, String> {
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_bitor()?;
         while matches!(self.peek(), Some(Token::And)) {
+            self.index += 1;
+            let right = self.parse_bitor()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::And,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitor(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_bitxor()?;
+        while matches!(self.peek(), Some(Token::BitOr)) {
+            self.index += 1;
+            let right = self.parse_bitxor()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::BitOr,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitxor(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_bitand()?;
+        while matches!(self.peek(), Some(Token::BitXor)) {
+            self.index += 1;
+            let right = self.parse_bitand()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::BitXor,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_bitand(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_unary()?;
+        while matches!(self.peek(), Some(Token::BitAnd)) {
             self.index += 1;
             let right = self.parse_unary()?;
             left = Value::Binary {
                 left: Box::new(left),
-                op: BinaryOperator::And,
+                op: BinaryOperator::BitAnd,
                 right: Box::new(right),
             };
         }
@@ -534,26 +727,72 @@ impl Parser {
                 value: Box::new(value),
             });
         }
+        if matches!(self.peek(), Some(Token::BitNot)) {
+            self.index += 1;
+            let value = self.parse_unary()?;
+            return Ok(Value::Unary {
+                op: UnaryOperator::BitNot,
+                value: Box::new(value),
+            });
+        }
 
         self.parse_comparison()
     }
 
     fn parse_comparison(&mut self) -> Result<Value, String> {
-        let mut left = self.parse_additive()?;
+        let mut left = self.parse_shift()?;
         while matches!(
             self.peek(),
             Some(Token::Equal)
+                | Some(Token::StrictEqual)
                 | Some(Token::NotEqual)
+                | Some(Token::StrictNotEqual)
                 | Some(Token::GreaterThan)
                 | Some(Token::LessThan)
                 | Some(Token::GreaterEqual)
                 | Some(Token::LessEqual)
         ) {
             let op = self.parse_comparison_operator()?;
-            let right = self.parse_additive()?;
+            let right = self.parse_shift()?;
             left = Value::Binary {
                 left: Box::new(left),
                 op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_shift(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_range()?;
+        while matches!(self.peek(), Some(Token::Shl) | Some(Token::Shr)) {
+            let op = if self.matches(Token::Shl) {
+                self.index += 1;
+                BinaryOperator::Shl
+            } else if self.matches(Token::Shr) {
+                self.index += 1;
+                BinaryOperator::Shr
+            } else {
+                return Err(format!("Expected operator, found {:?}", self.peek()));
+            };
+            let right = self.parse_range()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_range(&mut self) -> Result<Value, String> {
+        let mut left = self.parse_additive()?;
+        while matches!(self.peek(), Some(Token::DotDot)) {
+            self.index += 1;
+            let right = self.parse_additive()?;
+            left = Value::Binary {
+                left: Box::new(left),
+                op: BinaryOperator::Range,
                 right: Box::new(right),
             };
         }
@@ -609,7 +848,7 @@ impl Parser {
             Some(Token::StringLiteral(value)) => {
                 let value = value.clone();
                 self.index += 1;
-                Value::String(value)
+                desugar_interpolated_string(&value)?
             }
             Some(Token::NumberLiteral(value)) => {
                 let value = *value;
@@ -799,21 +1038,19 @@ impl Parser {
         match self.peek() {
             Some(Token::Equal) => {
                 self.index += 1;
-                if self.matches(Token::Equal) {
-                    self.index += 1;
-                    Ok(BinaryOperator::StrictEqual)
-                } else {
-                    Ok(BinaryOperator::Equal)
-                }
+                Ok(BinaryOperator::Equal)
+            }
+            Some(Token::StrictEqual) => {
+                self.index += 1;
+                Ok(BinaryOperator::StrictEqual)
             }
             Some(Token::NotEqual) => {
                 self.index += 1;
-                if self.matches(Token::Equal) {
-                    self.index += 1;
-                    Ok(BinaryOperator::StrictNotEqual)
-                } else {
-                    Ok(BinaryOperator::NotEqual)
-                }
+                Ok(BinaryOperator::NotEqual)
+            }
+            Some(Token::StrictNotEqual) => {
+                self.index += 1;
+                Ok(BinaryOperator::StrictNotEqual)
             }
             Some(Token::GreaterThan) => {
                 self.index += 1;
@@ -937,6 +1174,77 @@ impl Parser {
     }
 }
 
+/// `"hello ${var.name}!"` desugars to `"hello " + var.name + "!"`.
+/// Uses `+` concat (string + number supported). Unclosed `${` is an error.
+fn desugar_interpolated_string(raw: &str) -> Result<Value, String> {
+    if !raw.contains("${") {
+        return Ok(Value::String(raw.to_string()));
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut parts: Vec<Value> = Vec::new();
+    let mut literal = String::new();
+    let mut i = 0;
+    let flush = |literal: &mut String, parts: &mut Vec<Value>| {
+        if !literal.is_empty() {
+            parts.push(Value::String(std::mem::take(literal)));
+        }
+    };
+    while i < chars.len() {
+        if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+            flush(&mut literal, &mut parts);
+            // Find the matching close brace (nesting-aware for `{...}`).
+            let mut depth = 1;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                if chars[j] == '{' {
+                    depth += 1;
+                } else if chars[j] == '}' {
+                    depth -= 1;
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return Err("Unclosed ${ in string interpolation".to_string());
+            }
+            let inner: String = chars[i + 2..j - 1].iter().collect();
+            if inner.trim().is_empty() {
+                return Err("Empty ${} in string interpolation".to_string());
+            }
+            let mut inner_lexer = Lexer::new(&inner);
+            let tokens = inner_lexer.tokenize();
+            let mut inner_parser = Parser {
+                tokens,
+                index: 0,
+            };
+            let expr = inner_parser.parse_expression()?;
+            if !matches!(inner_parser.peek(), Some(Token::Eof)) {
+                return Err(format!(
+                    "Invalid expression in string interpolation: '{}'",
+                    inner
+                ));
+            }
+            parts.push(expr);
+            i = j;
+        } else {
+            literal.push(chars[i]);
+            i += 1;
+        }
+    }
+    flush(&mut literal, &mut parts);
+    if parts.is_empty() {
+        return Ok(Value::String(String::new()));
+    }
+    let mut iter = parts.into_iter();
+    let mut acc = iter.next().unwrap();
+    for part in iter {
+        acc = Value::Binary {
+            left: Box::new(acc),
+            op: BinaryOperator::Add,
+            right: Box::new(part),
+        };
+    }
+    Ok(acc)
+}
 /// `declare()` is only meaningful before any module code runs, so it must
 /// sit at file top level. Nested declares are a parse error.
 fn validate_top_level_declares(program: &Program) -> Result<(), String> {
@@ -975,6 +1283,26 @@ fn reject_nested_declare(stmt: &Statement) -> Result<(), String> {
         Statement::While { body, .. } | Statement::ForIn { body, .. } => {
             reject_nested_declare_in_block(body)
         }
+        Statement::Assign { target, value, .. } => {
+            reject_nested_declare_in_target(target)?;
+            reject_nested_declare_in_value(value)
+        }
+        Statement::Switch {
+            scrutinee,
+            cases,
+            default,
+            ..
+        } => {
+            reject_nested_declare_in_value(scrutinee)?;
+            for (case_value, body) in cases {
+                reject_nested_declare_in_value(case_value)?;
+                reject_nested_declare_in_block(body)?;
+            }
+            if let Some(default_body) = default {
+                reject_nested_declare_in_block(default_body)?;
+            }
+            Ok(())
+        }
         Statement::Try { body, catches } => {
             reject_nested_declare_in_block(body)?;
             for catch in catches {
@@ -983,6 +1311,17 @@ fn reject_nested_declare(stmt: &Statement) -> Result<(), String> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn reject_nested_declare_in_target(target: &AssignTarget) -> Result<(), String> {
+    match target {
+        AssignTarget::Var(_) => Ok(()),
+        AssignTarget::Property { target, .. } => reject_nested_declare_in_target(target),
+        AssignTarget::Index { target, index } => {
+            reject_nested_declare_in_target(target)?;
+            reject_nested_declare_in_value(index)
+        }
     }
 }
 
@@ -1068,6 +1407,63 @@ fn uncaught_message(err: &Value) -> String {
 }
 
 const MAX_LOOP_ITERS: usize = 1_000_000;
+const MAX_CALL_DEPTH: usize = 32;
+
+/// RAII decrement for the shared call-depth counter so early `?`
+/// returns (including catchable throws) never leak depth.
+struct DepthGuard {
+    depth: Rc<Cell<usize>>,
+}
+
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
+fn enter_call(rt: &ModuleRuntime) -> Result<DepthGuard, RuntimeFault> {    let depth = rt.call_depth.get() + 1;
+    rt.call_depth.set(depth);
+    if depth > MAX_CALL_DEPTH {
+        rt.call_depth.set(depth - 1);
+        return Err(fatal_err(
+            "maximum call depth exceeded (possible infinite recursion)",
+        ));
+    }
+    Ok(DepthGuard {
+        depth: Rc::clone(&rt.call_depth),
+    })
+}
+
+/// Bind call args to `arg.<param>`: positional args first, then declared
+/// defaults (resolved in the caller scope). Missing required params are a
+/// catchable `ValueError`; extras stay available via the `arg` array.
+#[allow(clippy::too_many_arguments)]
+fn bind_params(
+    params: &[String],
+    defaults: &HashMap<String, Value>,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+    function: &str,
+    local_env: &mut HashMap<String, Value>,
+) -> Result<(), RuntimeFault> {
+    for (i, param) in params.iter().enumerate() {
+        if let Some(arg) = args.get(i) {
+            let value = resolve_value(arg, environment, rt, cur)?;
+            local_env.insert(format!("arg.{}", param), value);
+        } else if let Some(default) = defaults.get(param) {
+            let value = resolve_value(default, environment, rt, cur)?;
+            local_env.insert(format!("arg.{}", param), value);
+        } else {
+            return Err(throw_err(
+                "ValueError",
+                format!("{}() missing required argument '{}'", function, param),
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub const ENTRY_ALIAS: &str = "__main__";
 
@@ -1103,6 +1499,7 @@ pub struct ModuleRuntime {
     modules: HashMap<String, LoadedModule>,
     canonical_to_alias: HashMap<PathBuf, String>,
     loading: Vec<PathBuf>,
+    call_depth: Rc<Cell<usize>>,
 }
 
 impl Default for ModuleRuntime {
@@ -1111,6 +1508,7 @@ impl Default for ModuleRuntime {
             modules: HashMap::new(),
             canonical_to_alias: HashMap::new(),
             loading: Vec::new(),
+            call_depth: Rc::new(Cell::new(0)),
         }
     }
 }
@@ -1224,6 +1622,53 @@ pub fn run_source(source: &str, base_dir: &Path, label: &Path) -> Result<(), Str
     result
 }
 
+/// Persistent session for the REPL: one runtime + one file scope kept
+/// alive across inputs. Each chunk is wrapped as top-level statements so
+/// `var` decls, functions, loops, and even `declare()` persist.
+pub struct Repl {
+    rt: ModuleRuntime,
+    env: HashMap<String, Value>,
+    base_dir: PathBuf,
+}
+
+impl Repl {
+    pub fn new(base_dir: PathBuf) -> Self {
+        Self {
+            rt: ModuleRuntime::default(),
+            env: HashMap::new(),
+            base_dir,
+        }
+    }
+
+    pub fn run_chunk(&mut self, chunk: &str) -> Result<(), String> {
+        let wrapped = format!("[SCRIPTTYPE KALVITA VERSION 1]\n{}\n", chunk);
+        let program = Parser::parse(&wrapped)?;
+        for stmt in &program.statements {
+            if let Statement::Declare { path, run } = stmt {
+                declare_module(&mut self.rt, &self.base_dir.clone(), path, *run)?;
+            }
+        }
+        self.rt.ensure_module(ENTRY_ALIAS);
+        for stmt in &program.statements {
+            if matches!(stmt, Statement::Declare { .. }) {
+                continue;
+            }
+            match execute_statement(stmt, &mut self.env, &mut self.rt, ENTRY_ALIAS) {
+                Ok(Flow::Normal) => {}
+                Ok(Flow::Break) => return Err("break outside loop".to_string()),
+                Ok(Flow::Continue) => return Err("continue outside loop".to_string()),
+                Ok(Flow::Return(_)) => {
+                    return Err("return can only be used inside a function body".to_string())
+                }
+                Err(RuntimeFault::Fatal(msg)) => return Err(msg),
+                Err(RuntimeFault::Throw(err)) => return Err(uncaught_message(&err)),
+            }
+        }
+        self.rt.snapshot_top_locals(ENTRY_ALIAS, &self.env);
+        Ok(())
+    }
+}
+
 fn execute_with_runtime(
     program: &Program,
     rt: &mut ModuleRuntime,
@@ -1258,6 +1703,22 @@ fn execute_with_runtime(
     Ok(())
 }
 
+/// Find the enclosing project root (nearest dir holding `kal.toml`).
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = if start.is_file() {
+        start.parent().map(Path::to_path_buf)
+    } else {
+        Some(start.to_path_buf())
+    };
+    while let Some(current) = dir {
+        if current.join("kal.toml").is_file() {
+            return Some(current);
+        }
+        dir = current.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
 /// Resolve + load one `declare()` import. Cached by canonical path;
 /// a later `run=true` upgrades a previously `run=false` load.
 fn declare_module(
@@ -1266,7 +1727,17 @@ fn declare_module(
     raw: &str,
     run: bool,
 ) -> Result<(), String> {
-    let joined = if raw.starts_with('/') {
+    let joined = if raw.starts_with("@/") {
+        match find_project_root(importer_dir) {
+            Some(root) => root.join(&raw[2..]),
+            None => {
+                return Err(format!(
+                    "Module error: '@/...' needs a kal.toml project root (imported from '{}')",
+                    importer_dir.display()
+                ))
+            }
+        }
+    } else if raw.starts_with('/') {
         PathBuf::from(raw)
     } else {
         importer_dir.join(raw)
@@ -1472,6 +1943,462 @@ fn execute_block(
     Ok(Flow::Normal)
 }
 
+/// Display a value as a string for `str.From` / `file.Write`.
+fn stringify_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "null".to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Logic(b) => b.to_string(),
+        other => format_value(other.clone()),
+    }
+}
+
+fn resolve_args(
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Vec<Value>, RuntimeFault> {
+    args.iter()
+        .map(|arg| resolve_value(arg, environment, rt, cur))
+        .collect()
+}
+
+fn expect_string(value: &Value, what: &str) -> Result<String, RuntimeFault> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        _ => Err(throw_err(
+            "TypeError",
+            format!("{} expects a string, got {:?}", what, value),
+        )),
+    }
+}
+
+fn expect_number(value: &Value, what: &str) -> Result<f64, RuntimeFault> {
+    match value {
+        Value::Number(n) => Ok(*n),
+        _ => Err(throw_err(
+            "TypeError",
+            format!("{} expects a number, got {:?}", what, value),
+        )),
+    }
+}
+
+fn expect_array(value: &Value, what: &str) -> Result<Vec<Value>, RuntimeFault> {
+    match value {
+        Value::Array(items) => Ok(items.clone()),
+        _ => Err(throw_err(
+            "TypeError",
+            format!("{} expects an array, got {:?}", what, value),
+        )),
+    }
+}
+
+fn expect_int(value: &Value, what: &str) -> Result<i64, RuntimeFault> {
+    match value {
+        Value::Number(n) => as_i64(*n).map_err(|_| {
+            throw_err(
+                "ValueError",
+                format!("{} expects an integer, got {}", what, n),
+            )
+        }),
+        _ => Err(throw_err(
+            "TypeError",
+            format!("{} expects a number, got {:?}", what, value),
+        )),
+    }
+}
+
+fn invoke_math(
+    function: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Option<Value>, RuntimeFault> {
+    let resolved = resolve_args(args, environment, rt, cur)?;
+    match function {
+        "Sin" | "Cos" | "Tan" | "Sqrt" | "Floor" | "Ceil" | "Abs" => {
+            let n = match resolved.as_slice() {
+                [v] => expect_number(v, function)?,
+                _ => {
+                    return Err(throw_err(
+                        "ValueError",
+                        format!("{} expects exactly one argument", function),
+                    ))
+                }
+            };
+            let result = match function {
+                "Sin" => n.sin(),
+                "Cos" => n.cos(),
+                "Tan" => n.tan(),
+                "Sqrt" => {
+                    if n < 0.0 {
+                        return Err(throw_err("ValueError", "Sqrt of negative number"));
+                    }
+                    n.sqrt()
+                }
+                "Floor" => n.floor(),
+                "Ceil" => n.ceil(),
+                _ => n.abs(),
+            };
+            Ok(Some(Value::Number(result)))
+        }
+        "Pow" => match resolved.as_slice() {
+            [a, b] => Ok(Some(Value::Number(
+                expect_number(a, "Pow")?.powf(expect_number(b, "Pow")?),
+            ))),
+            _ => Err(throw_err("ValueError", "Pow expects exactly two arguments")),
+        },
+        "Min" | "Max" => {
+            if resolved.is_empty() {
+                return Err(throw_err(
+                    "ValueError",
+                    format!("{} expects at least one argument", function),
+                ));
+            }
+            let mut numbers = Vec::with_capacity(resolved.len());
+            for v in &resolved {
+                numbers.push(expect_number(v, function)?);
+            }
+            let best = numbers.into_iter().fold(None, |acc: Option<f64>, n| {
+                Some(match acc {
+                    None => n,
+                    Some(m) if function == "Min" => m.min(n),
+                    Some(m) => m.max(n),
+                })
+            });
+            Ok(Some(Value::Number(best.unwrap_or(0.0))))
+        }
+        "Clamp" => match resolved.as_slice() {
+            [x, lo, hi] => {
+                let (x, lo, hi) = (
+                    expect_number(x, "Clamp")?,
+                    expect_number(lo, "Clamp")?,
+                    expect_number(hi, "Clamp")?,
+                );
+                Ok(Some(Value::Number(x.clamp(lo.min(hi), lo.max(hi)))))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                "Clamp expects (value, low, high)",
+            )),
+        },
+        "Random" => {
+            if !resolved.is_empty() {
+                return Err(throw_err("ValueError", "Random expects no arguments"));
+            }
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 ^ (d.as_secs()))
+                .unwrap_or(0x9E3779B97F4A7C15);
+            // xorshift64* — no external crates needed.
+            let mut x = nanos | 1;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            let out = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64
+                / (u64::MAX >> 11) as f64;
+            Ok(Some(Value::Number(out)))
+        }
+        _ => Err(throw_err(
+            "NameError",
+            format!("Unknown math function: {}", function),
+        )),
+    }
+}
+
+fn invoke_str(
+    function: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Option<Value>, RuntimeFault> {
+    let resolved = resolve_args(args, environment, rt, cur)?;
+    match function {
+        "Len" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::Number(expect_string(v, "Len")?.chars().count() as f64))),
+            _ => Err(throw_err("ValueError", "Len expects exactly one string")),
+        },
+        "Upper" | "Lower" => match resolved.as_slice() {
+            [v] => {
+                let s = expect_string(v, function)?;
+                Ok(Some(Value::String(if function == "Upper" {
+                    s.to_uppercase()
+                } else {
+                    s.to_lowercase()
+                })))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                format!("{} expects exactly one string", function),
+            )),
+        },
+        "Split" => match resolved.as_slice() {
+            [s, sep] => {
+                let (s, sep) = (expect_string(s, "Split")?, expect_string(sep, "Split")?);
+                Ok(Some(Value::Array(
+                    s.split(sep.as_str())
+                        .map(|p| Value::String(p.to_string()))
+                        .collect(),
+                )))
+            }
+            _ => Err(throw_err("ValueError", "Split expects (string, separator)")),
+        },
+        "Join" => match resolved.as_slice() {
+            [arr, sep] => {
+                let (items, sep) = (expect_array(arr, "Join")?, expect_string(sep, "Join")?);
+                let mut parts = Vec::with_capacity(items.len());
+                for item in &items {
+                    parts.push(stringify_value(item));
+                }
+                Ok(Some(Value::String(parts.join(sep.as_str()))))
+            }
+            _ => Err(throw_err("ValueError", "Join expects (array, separator)")),
+        },
+        "Contains" => match resolved.as_slice() {
+            [s, sub] => {
+                let (s, sub) = (expect_string(s, "Contains")?, expect_string(sub, "Contains")?);
+                Ok(Some(Value::Logic(s.contains(sub.as_str()))))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                "Contains expects (string, substring)",
+            )),
+        },
+        "Replace" => match resolved.as_slice() {
+            [s, old, new] => {
+                let (s, old, new) = (
+                    expect_string(s, "Replace")?,
+                    expect_string(old, "Replace")?,
+                    expect_string(new, "Replace")?,
+                );
+                Ok(Some(Value::String(s.replace(old.as_str(), new.as_str()))))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                "Replace expects (string, old, new)",
+            )),
+        },
+        "Trim" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::String(
+                expect_string(v, "Trim")?.trim().to_string(),
+            ))),
+            _ => Err(throw_err("ValueError", "Trim expects exactly one string")),
+        },
+        "Sub" => match resolved.as_slice() {
+            [s, start] => {
+                let (s, start) = (expect_string(s, "Sub")?, expect_int(start, "Sub")?);
+                substring(s, start, None).map(Value::String).map(Some)
+            }
+            [s, start, len] => {
+                let (s, start, len) = (
+                    expect_string(s, "Sub")?,
+                    expect_int(start, "Sub")?,
+                    expect_int(len, "Sub")?,
+                );
+                substring(s, start, Some(len)).map(Value::String).map(Some)
+            }
+            _ => Err(throw_err("ValueError", "Sub expects (string, start[, length])")),
+        },
+        "From" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::String(stringify_value(v)))),
+            _ => Err(throw_err("ValueError", "From expects exactly one value")),
+        },
+        "ToNum" => match resolved.as_slice() {
+            [v] => {
+                let s = expect_string(v, "ToNum")?;
+                s.trim().parse::<f64>().map(Value::Number).map(Some).map_err(|_| {
+                    throw_err("ValueError", format!("cannot convert to number: '{}'", s))
+                })
+            }
+            _ => Err(throw_err("ValueError", "ToNum expects exactly one string")),
+        },
+        _ => Err(throw_err(
+            "NameError",
+            format!("Unknown str function: {}", function),
+        )),
+    }
+}
+
+fn substring(s: String, start: i64, len: Option<i64>) -> Result<String, RuntimeFault> {
+    if start < 0 {
+        return Err(throw_err("ValueError", "Sub start must be >= 0"));
+    }
+    if let Some(len) = len {
+        if len < 0 {
+            return Err(throw_err("ValueError", "Sub length must be >= 0"));
+        }
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let start = (start as usize).min(chars.len());
+    let end = match len {
+        Some(len) => (start + len as usize).min(chars.len()),
+        None => chars.len(),
+    };
+    Ok(chars[start..end].iter().collect())
+}
+
+fn invoke_arr(
+    function: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Option<Value>, RuntimeFault> {
+    let resolved = resolve_args(args, environment, rt, cur)?;
+    match function {
+        "Len" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::Number(expect_array(v, "Len")?.len() as f64))),
+            _ => Err(throw_err("ValueError", "Len expects exactly one array")),
+        },
+        "Push" => match resolved.as_slice() {
+            [arr, value] => {
+                let mut items = expect_array(arr, "Push")?;
+                items.push(value.clone());
+                Ok(Some(Value::Array(items)))
+            }
+            _ => Err(throw_err("ValueError", "Push expects (array, value)")),
+        },
+        "Pop" => match resolved.as_slice() {
+            [arr] => {
+                let mut items = expect_array(arr, "Pop")?;
+                if items.is_empty() {
+                    return Err(throw_err("IndexError", "Pop from empty array"));
+                }
+                items.pop();
+                Ok(Some(Value::Array(items)))
+            }
+            _ => Err(throw_err("ValueError", "Pop expects exactly one array")),
+        },
+        "Reverse" => match resolved.as_slice() {
+            [arr] => {
+                let mut items = expect_array(arr, "Reverse")?;
+                items.reverse();
+                Ok(Some(Value::Array(items)))
+            }
+            _ => Err(throw_err("ValueError", "Reverse expects exactly one array")),
+        },
+        "Sort" => match resolved.as_slice() {
+            [arr] => {
+                let mut items = expect_array(arr, "Sort")?;
+                if items.iter().all(|v| matches!(v, Value::Number(_))) {
+                    items.sort_by(|a, b| match (a, b) {
+                        (Value::Number(x), Value::Number(y)) => {
+                            x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+                        }
+                        _ => std::cmp::Ordering::Equal,
+                    });
+                } else if items.iter().all(|v| matches!(v, Value::String(_))) {
+                    items.sort_by(|a, b| match (a, b) {
+                        (Value::String(x), Value::String(y)) => x.cmp(y),
+                        _ => std::cmp::Ordering::Equal,
+                    });
+                } else {
+                    return Err(throw_err(
+                        "TypeError",
+                        "Sort needs all numbers or all strings",
+                    ));
+                }
+                Ok(Some(Value::Array(items)))
+            }
+            _ => Err(throw_err("ValueError", "Sort expects exactly one array")),
+        },
+        "Join" => match resolved.as_slice() {
+            [arr, sep] => {
+                let (items, sep) = (expect_array(arr, "Join")?, expect_string(sep, "Join")?);
+                let mut parts = Vec::with_capacity(items.len());
+                for item in &items {
+                    parts.push(stringify_value(item));
+                }
+                Ok(Some(Value::String(parts.join(sep.as_str()))))
+            }
+            _ => Err(throw_err("ValueError", "Join expects (array, separator)")),
+        },
+        "Keys" => match resolved.as_slice() {
+            [Value::Object(map)] => {
+                let mut keys: Vec<Value> = map.keys().cloned().map(Value::String).collect();
+                keys.sort_by(|a, b| match (a, b) {
+                    (Value::String(x), Value::String(y)) => x.cmp(y),
+                    _ => std::cmp::Ordering::Equal,
+                });
+                Ok(Some(Value::Array(keys)))
+            }
+            [other] => Err(throw_err(
+                "TypeError",
+                format!("Keys expects an object, got {:?}", other),
+            )),
+            _ => Err(throw_err("ValueError", "Keys expects exactly one object")),
+        },
+        "Has" => match resolved.as_slice() {
+            [Value::Array(items), needle] => Ok(Some(Value::Logic(items.contains(needle)))),
+            [Value::Object(map), Value::String(key)] => {
+                Ok(Some(Value::Logic(map.contains_key(key))))
+            }
+            [container, _] => Err(throw_err(
+                "TypeError",
+                format!("Has expects (array, value) or (object, key), got {:?}", container),
+            )),
+            _ => Err(throw_err("ValueError", "Has expects two arguments")),
+        },
+        "Get" => match resolved.as_slice() {
+            [arr, idx] => {
+                let (items, idx) = (expect_array(arr, "Get")?, expect_int(idx, "Get")?);
+                if idx < 0 {
+                    return Err(throw_err("IndexError", format!("Index out of bounds: {}", idx)));
+                }
+                items.get(idx as usize).cloned().ok_or_else(|| {
+                    throw_err("IndexError", format!("Index out of bounds: {}", idx))
+                }).map(Some)
+            }
+            _ => Err(throw_err("ValueError", "Get expects (array, index)")),
+        },
+        "Slice" => match resolved.as_slice() {
+            [arr, start] => {
+                let (items, start) = (expect_array(arr, "Slice")?, expect_int(start, "Slice")?);
+                slice_array(items, start, None).map(Value::Array).map(Some)
+            }
+            [arr, start, len] => {
+                let (items, start, len) = (
+                    expect_array(arr, "Slice")?,
+                    expect_int(start, "Slice")?,
+                    expect_int(len, "Slice")?,
+                );
+                slice_array(items, start, Some(len)).map(Value::Array).map(Some)
+            }
+            _ => Err(throw_err("ValueError", "Slice expects (array, start[, length])")),
+        },
+        _ => Err(throw_err(
+            "NameError",
+            format!("Unknown arr function: {}", function),
+        )),
+    }
+}
+
+fn slice_array(
+    items: Vec<Value>,
+    start: i64,
+    len: Option<i64>,
+) -> Result<Vec<Value>, RuntimeFault> {
+    if start < 0 {
+        return Err(throw_err("ValueError", "Slice start must be >= 0"));
+    }
+    if let Some(len) = len {
+        if len < 0 {
+            return Err(throw_err("ValueError", "Slice length must be >= 0"));
+        }
+    }
+    let start = (start as usize).min(items.len());
+    let end = match len {
+        Some(len) => (start + len as usize).min(items.len()),
+        None => items.len(),
+    };
+    Ok(items[start..end].to_vec())
+}
+
 fn invoke_function(
     object: Option<&str>,
     module: Option<&str>,
@@ -1504,7 +2431,12 @@ fn invoke_function(
                 )
             })?;
         match callee {
-            Value::Function { params, body } => {
+            Value::Function {
+                params,
+                defaults,
+                body,
+            } => {
+                let _guard = enter_call(rt)?;
                 let mut local_env = rt.module_merged_env(alias);
                 let argument_array = Value::Array(
                     args.iter()
@@ -1514,10 +2446,7 @@ fn invoke_function(
                 local_env.insert("pass".to_string(), Value::Null);
                 local_env.insert("arg".to_string(), argument_array.clone());
                 local_env.insert("args".to_string(), argument_array);
-                for (param, arg) in params.iter().zip(args.iter()) {
-                    let value = resolve_value(arg, environment, rt, cur)?;
-                    local_env.insert(format!("arg.{}", param), value);
-                }
+                bind_params(&params, &defaults, args, environment, rt, cur, function, &mut local_env)?;
                 let mut result = None;
                 for stmt in body {
                     match execute_statement(&stmt, &mut local_env, rt, alias)? {
@@ -1552,21 +2481,94 @@ fn invoke_function(
             println!("{}", rendered.join(" "));
             Ok(None)
         }
-        Some(obj) if obj == "math" => {
-            let value = match args {
-                [arg] => resolve_value(arg, environment, rt, cur)?,
-                _ => return Err(throw_err("ValueError", format!("{} expects exactly one argument", function))),
+        Some(obj) if obj == "con" && function == "Input" => {
+            let prompt = match args {
+                [] => String::new(),
+                [arg] => match resolve_value(arg, environment, rt, cur)? {
+                    Value::String(s) => s,
+                    other => format_value(other),
+                },
+                _ => {
+                    return Err(throw_err(
+                        "ValueError",
+                        "Input expects zero or one argument",
+                    ))
+                }
             };
-            let number = match value {
-                Value::Number(value) => value,
-                _ => return Err(throw_err("TypeError", format!("{} expects a numeric argument", function))),
-            };
-
+            if !prompt.is_empty() {
+                print!("{}", prompt);
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+                .map_err(|e| throw_err("IOError", format!("Input failed: {}", e)))?;
+            Ok(Some(Value::String(
+                line.trim_end_matches(&['\n', '\r'][..]).to_string(),
+            )))
+        }
+        Some(obj) if obj == "math" => invoke_math(function, args, environment, rt, cur),
+        Some(obj) if obj == "str" => invoke_str(function, args, environment, rt, cur),
+        Some(obj) if obj == "arr" => invoke_arr(function, args, environment, rt, cur),
+        Some(obj) if obj == "time" => {
+            if !args.is_empty() {
+                return Err(throw_err("ValueError", "Now expects no arguments"));
+            }
             match function {
-                "Sin" => Ok(Some(Value::Number(number.sin()))),
-                "Cos" => Ok(Some(Value::Number(number.cos()))),
-                "Tan" => Ok(Some(Value::Number(number.tan()))),
-                _ => Err(throw_err("NameError", format!("Unknown math function: {}", function))),
+                "Now" => {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let millis = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|e| throw_err("IOError", format!("clock failed: {}", e)))?
+                        .as_millis();
+                    #[allow(clippy::cast_precision_loss)]
+                    Ok(Some(Value::Number(millis as f64)))
+                }
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown time function: {}", function),
+                )),
+            }
+        }
+        Some(obj) if obj == "file" => {
+            let resolved: Vec<Value> = args
+                .iter()
+                .map(|arg| resolve_value(arg, environment, rt, cur))
+                .collect::<Result<Vec<_>, RuntimeFault>>()?;
+            match function {
+                "Read" => {
+                    let path = match resolved.as_slice() {
+                        [Value::String(path)] => path.clone(),
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Read expects exactly one path string",
+                            ))
+                        }
+                    };
+                    fs::read_to_string(&path)
+                        .map(Value::String)
+                        .map(Some)
+                        .map_err(|e| throw_err("IOError", format!("cannot read '{}': {}", path, e)))
+                }
+                "Write" => {
+                    let (path, content) = match resolved.as_slice() {
+                        [Value::String(path), content] => (path.clone(), stringify_value(content)),
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Write expects a path string and content",
+                            ))
+                        }
+                    };
+                    fs::write(&path, content)
+                        .map(|()| Some(Value::Null))
+                        .map_err(|e| throw_err("IOError", format!("cannot write '{}': {}", path, e)))
+                }
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown file function: {}", function),
+                )),
             }
         }
         _ => {
@@ -1603,7 +2605,12 @@ fn invoke_function(
                 })?;
 
             match callee {
-                Value::Function { params, body } => {
+                Value::Function {
+                    params,
+                    defaults,
+                    body,
+                } => {
+                    let _guard = enter_call(rt)?;
                     let mut local_env = environment.clone();
                     let argument_array = Value::Array(
                         args.iter()
@@ -1613,11 +2620,7 @@ fn invoke_function(
                     local_env.insert("pass".to_string(), passed_value);
                     local_env.insert("arg".to_string(), argument_array.clone());
                     local_env.insert("args".to_string(), argument_array);
-                    for (param, arg) in params.iter().zip(args.iter()) {
-                        let value = resolve_value(arg, environment, rt, cur)?;
-                        let scoped = format!("arg.{}", param);
-                        local_env.insert(scoped, value);
-                    }
+                    bind_params(&params, &defaults, args, environment, rt, cur, function, &mut local_env)?;
 
                     let mut result = None;
                     for stmt in body {
@@ -1682,6 +2685,39 @@ fn execute_statement(
         }
         Statement::Declare { .. } => {
             // Handled by the loader before execution; no-op here.
+            Ok(Flow::Normal)
+        }
+        Statement::Assign { target, op, value } => {
+            let new_value = resolve_value(value, environment, rt, cur)?;
+            let final_value = match op {
+                None => {
+                    // Plain `=` requires the target to exist (declare first).
+                    read_assign_target(target, environment, rt, cur)?;
+                    new_value
+                }
+                Some(binop) => {
+                    let current = read_assign_target(target, environment, rt, cur)?;
+                    evaluate_binary(current, new_value, binop)?
+                }
+            };
+            write_assign_target(target, final_value, environment, rt, cur)?;
+            Ok(Flow::Normal)
+        }
+        Statement::Switch {
+            scrutinee,
+            cases,
+            default,
+        } => {
+            let subject = resolve_value(scrutinee, environment, rt, cur)?;
+            for (case_value, body) in cases {
+                let expected = resolve_value(case_value, environment, rt, cur)?;
+                if values_strict_equal(&subject, &expected) {
+                    return execute_block(body, environment, rt, cur);
+                }
+            }
+            if let Some(default_body) = default {
+                return execute_block(default_body, environment, rt, cur);
+            }
             Ok(Flow::Normal)
         }
         Statement::Return { value } => {
@@ -1752,6 +2788,68 @@ fn execute_statement(
             Err(fatal_err("possible infinite loop: while exceeded iteration limit"))
         }
         Statement::ForIn { var, iterable, body } => {
+            // `for (i in 0..10)` iterates 0..=9 (end-exclusive). Bounds
+            // truncate to i64; empty when start >= end.
+            if let Value::Binary {
+                left,
+                op: BinaryOperator::Range,
+                right,
+            } = iterable
+            {
+                let start = match resolve_value(left, environment, rt, cur)? {
+                    Value::Number(n) => as_i64(n)?,
+                    other => {
+                        return Err(throw_err(
+                            "TypeError",
+                            format!("range bounds must be numbers, got {:?}", other),
+                        ))
+                    }
+                };
+                let end = match resolve_value(right, environment, rt, cur)? {
+                    Value::Number(n) => as_i64(n)?,
+                    other => {
+                        return Err(throw_err(
+                            "TypeError",
+                            format!("range bounds must be numbers, got {:?}", other),
+                        ))
+                    }
+                };
+                let key = format!("var.{}", var);
+                let saved = environment.get(&key).cloned();
+                let saved_global = if rt.is_global(cur, var) {
+                    rt.read_global(cur, var)
+                } else {
+                    None
+                };
+                let shadows_global = rt.is_global(cur, var);
+                let mut i = start;
+                while i < end {
+                    let item = Value::Number(i as f64);
+                    environment.insert(key.clone(), item.clone());
+                    if shadows_global {
+                        rt.ensure_module(cur);
+                        rt.modules
+                            .get_mut(cur)
+                            .unwrap()
+                            .globals
+                            .insert(key.clone(), item);
+                    }
+                    match execute_block(body, environment, rt, cur)? {
+                        Flow::Normal => {}
+                        Flow::Break => break,
+                        Flow::Continue => {}
+                        Flow::Return(value) => {
+                            restore_saved(environment, &key, saved);
+                            restore_global(rt, cur, &key, saved_global);
+                            return Ok(Flow::Return(value));
+                        }
+                    }
+                    i += 1;
+                }
+                restore_saved(environment, &key, saved);
+                restore_global(rt, cur, &key, saved_global);
+                return Ok(Flow::Normal);
+            }
             let resolved_iterable = resolve_value(iterable, environment, rt, cur)?;
             let items: Vec<Value> = match resolved_iterable {
                 Value::Array(items) => items,
@@ -1883,6 +2981,170 @@ fn restore_global(rt: &mut ModuleRuntime, alias: &str, key: &str, saved: Option<
     }
 }
 
+/// Strict (`===`) equality for `switch/case`: case-sensitive strings,
+/// no cross-type coercion.
+fn values_strict_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x == y,
+        (Value::String(x), Value::String(y)) => x == y,
+        (Value::Logic(x), Value::Logic(y)) => x == y,
+        (Value::Null, Value::Null) => true,
+        (Value::Array(x), Value::Array(y)) => x == y,
+        (Value::Object(x), Value::Object(y)) => x == y,
+        (Value::Error { error_type: t1, message: m1 }, Value::Error { error_type: t2, message: m2 }) => {
+            t1 == t2 && m1 == m2
+        }
+        _ => false,
+    }
+}
+
+/// Read the current value at an assignment target. Missing names,
+/// properties, or indices are catchable errors.
+fn read_assign_target(
+    target: &AssignTarget,
+    environment: &HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Value, RuntimeFault> {
+    match target {
+        AssignTarget::Var(name) => lookup_scoped(name, environment, rt, cur).ok_or_else(|| {
+            throw_err(
+                "NameError",
+                format!("Cannot assign to undeclared variable: var.{}", name),
+            )
+        }),
+        AssignTarget::Property { target: inner, key } => {
+            let container = read_assign_target(inner, environment, rt, cur)?;
+            match container {
+                Value::Object(map) => map.get(key).cloned().ok_or_else(|| {
+                    throw_err("NameError", format!("Unknown property: {}", key))
+                }),
+                other => Err(throw_err(
+                    "TypeError",
+                    format!("Property access requires an object, got {:?}", other),
+                )),
+            }
+        }
+        AssignTarget::Index { target: inner, index } => {
+            let container = read_assign_target(inner, environment, rt, cur)?;
+            let idx_value = resolve_value(index, environment, rt, cur)?;
+            let idx = match idx_value {
+                Value::Number(n)
+                    if n.is_finite() && n.fract() == 0.0 && n >= 0.0 =>
+                {
+                    n as usize
+                }
+                _ => {
+                    return Err(throw_err(
+                        "TypeError",
+                        "index must be a non-negative integer",
+                    ))
+                }
+            };
+            match container {
+                Value::Array(items) => items.get(idx).cloned().ok_or_else(|| {
+                    throw_err("IndexError", format!("Index out of bounds: {}", idx))
+                }),
+                Value::String(value) => value
+                    .chars()
+                    .nth(idx)
+                    .map(|ch| Value::String(ch.to_string()))
+                    .ok_or_else(|| {
+                        throw_err("IndexError", format!("Index out of bounds: {}", idx))
+                    }),
+                other => Err(throw_err(
+                    "TypeError",
+                    format!("Index requires an array or string, got {:?}", other),
+                )),
+            }
+        }
+    }
+}
+
+/// Write a value at an assignment target. Containers are cloned,
+/// mutated, and written back to the root `var.*` (live store included).
+fn write_assign_target(
+    target: &AssignTarget,
+    new_value: Value,
+    environment: &mut HashMap<String, Value>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<(), RuntimeFault> {
+    match target {
+        AssignTarget::Var(name) => {
+            let key = format!("var.{}", name);
+            if lookup_scoped(name, environment, rt, cur).is_none() {
+                return Err(throw_err(
+                    "NameError",
+                    format!("Cannot assign to undeclared variable: var.{}", name),
+                ));
+            }
+            environment.insert(key.clone(), new_value.clone());
+            if rt.is_global(cur, name) {
+                rt.ensure_module(cur);
+                rt.modules
+                    .get_mut(cur)
+                    .unwrap()
+                    .globals
+                    .insert(key, new_value);
+            }
+            Ok(())
+        }
+        AssignTarget::Property { target: inner, key } => {
+            let mut container = read_assign_target(inner, environment, rt, cur)?;
+            match &mut container {
+                Value::Object(map) => {
+                    map.insert(key.clone(), new_value);
+                }
+                other => {
+                    return Err(throw_err(
+                        "TypeError",
+                        format!("Property access requires an object, got {:?}", other),
+                    ))
+                }
+            }
+            write_assign_target(inner, container, environment, rt, cur)
+        }
+        AssignTarget::Index { target: inner, index } => {
+            let idx_value = resolve_value(index, environment, rt, cur)?;
+            let idx = match idx_value {
+                Value::Number(n) if n.is_finite() && n.fract() == 0.0 && n >= 0.0 => n as usize,
+                _ => {
+                    return Err(throw_err(
+                        "TypeError",
+                        "index must be a non-negative integer",
+                    ))
+                }
+            };
+            let mut container = read_assign_target(inner, environment, rt, cur)?;
+            match &mut container {
+                Value::Array(items) => {
+                    if idx >= items.len() {
+                        return Err(throw_err(
+                            "IndexError",
+                            format!("Index out of bounds: {}", idx),
+                        ));
+                    }
+                    items[idx] = new_value;
+                }
+                Value::String(_) => {
+                    return Err(throw_err(
+                        "TypeError",
+                        "cannot assign into string characters",
+                    ))
+                }
+                other => {
+                    return Err(throw_err(
+                        "TypeError",
+                        format!("Index requires an array or string, got {:?}", other),
+                    ))
+                }
+            }
+            write_assign_target(inner, container, environment, rt, cur)
+        }
+    }
+}
+
 /// Own-file `var.<short>` read: the live global store wins when the name
 /// was declared `var global`, otherwise the local scope.
 fn lookup_scoped(
@@ -1981,22 +3243,38 @@ fn resolve_value(
         Value::Index { target, index } => {
             let target_value = resolve_value(target, environment, rt, cur)?;
             let index_value = resolve_value(index, environment, rt, cur)?;
-            match (target_value, index_value) {
-                (Value::Array(items), Value::Number(index)) => {
-                    let idx = index as usize;
-                    items.get(idx)
-                        .cloned()
-                        .ok_or_else(|| throw_err("IndexError", format!("Index out of bounds: {}", idx)))
+            let idx = match index_value {
+                Value::Number(n) => {
+                    if !n.is_finite() || n.fract() != 0.0 || n < 0.0 {
+                        return Err(throw_err(
+                            "TypeError",
+                            format!("index must be a non-negative integer, got {}", n),
+                        ));
+                    }
+                    n as usize
                 }
-                (Value::String(value), Value::Number(index)) => {
-                    let idx = index as usize;
+                other => {
+                    return Err(throw_err(
+                        "TypeError",
+                        format!("Index requires an array or string with a numeric index, got {:?}", other),
+                    ))
+                }
+            };
+            match target_value {
+                Value::Array(items) => items.get(idx).cloned().ok_or_else(|| {
+                    throw_err("IndexError", format!("Index out of bounds: {}", idx))
+                }),
+                Value::String(value) => {
                     let ch = value
                         .chars()
                         .nth(idx)
                         .ok_or_else(|| throw_err("IndexError", format!("Index out of bounds: {}", idx)))?;
                     Ok(Value::String(ch.to_string()))
                 }
-                _ => Err(throw_err("TypeError", "Index requires an array or string with a numeric index")),
+                other => Err(throw_err(
+                    "TypeError",
+                    format!("Index requires an array or string, got {:?}", other),
+                )),
             }
         }
         Value::Binary { left, op, right } => {
@@ -2015,7 +3293,58 @@ fn resolve_value(
 fn evaluate_unary(value: Value, op: &UnaryOperator) -> Result<Value, RuntimeFault> {
     match op {
         UnaryOperator::Not => Ok(Value::Logic(!is_truthy(&value))),
+        UnaryOperator::BitNot => match value {
+            Value::Number(n) => Ok(Value::Number((!as_i64(n)?) as f64)),
+            Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        Value::Number(n) => out.push(Value::Number((!as_i64(n)?) as f64)),
+                        other => {
+                            return Err(throw_err(
+                                "TypeError",
+                                format!("~ requires numbers, got {:?}", other),
+                            ))
+                        }
+                    }
+                }
+                Ok(Value::Array(out))
+            }
+            other => Err(throw_err(
+                "TypeError",
+                format!("~ requires a number, got {:?}", other),
+            )),
+        },
     }
+}
+
+/// Truncate f64 toward zero to i64 for bitwise ops. Non-finite and
+/// out-of-range values are catchable errors, not silent garbage.
+fn as_i64(n: f64) -> Result<i64, RuntimeFault> {
+    if !n.is_finite() {
+        return Err(throw_err(
+            "ValueError",
+            format!("bitwise requires a finite integer, got {}", n),
+        ));
+    }
+    if n < i64::MIN as f64 || n >= 9.223372036854776e18 {
+        return Err(throw_err(
+            "ValueError",
+            format!("bitwise operand out of i64 range: {}", n),
+        ));
+    }
+    Ok(n.trunc() as i64)
+}
+
+fn check_shift_amount(n: f64) -> Result<u32, RuntimeFault> {
+    let amount = as_i64(n)?;
+    if amount < 0 || amount >= 64 {
+        return Err(throw_err(
+            "ValueError",
+            format!("shift amount must be 0..64, got {}", n),
+        ));
+    }
+    Ok(amount as u32)
 }
 
 fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Value, RuntimeFault> {
@@ -2051,6 +3380,46 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
             (Value::Number(a), Value::Number(b)) if b != 0.0 => Ok(Value::Number(a / b)),
             _ => Err(throw_err("DivZero", "Division requires non-zero numbers")),
         },
+        BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor => {
+            match (left, right) {
+                (Value::Array(left_items), Value::Array(right_items)) => {
+                    apply_array_array_op(left_items, right_items, op)
+                }
+                (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+                (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
+                (Value::Number(a), Value::Number(b)) => {
+                    let (x, y) = (as_i64(a)?, as_i64(b)?);
+                    let result = match op {
+                        BinaryOperator::BitAnd => x & y,
+                        BinaryOperator::BitOr => x | y,
+                        _ => x ^ y,
+                    };
+                    Ok(Value::Number(result as f64))
+                }
+                _ => Err(throw_err("TypeError", "bitwise requires numbers")),
+            }
+        }
+        BinaryOperator::Shl | BinaryOperator::Shr => match (left, right) {
+            (Value::Array(left_items), Value::Array(right_items)) => {
+                apply_array_array_op(left_items, right_items, op)
+            }
+            (Value::Array(items), scalar) => apply_array_scalar_op(items, scalar, op),
+            (scalar, Value::Array(items)) => apply_array_scalar_op(items, scalar, op),
+            (Value::Number(a), Value::Number(b)) => {
+                let x = as_i64(a)?;
+                let amount = check_shift_amount(b)?;
+                let result = match op {
+                    BinaryOperator::Shl => x.wrapping_shl(amount),
+                    _ => x.wrapping_shr(amount),
+                };
+                Ok(Value::Number(result as f64))
+            }
+            _ => Err(throw_err("TypeError", "shifts require numbers")),
+        },
+        BinaryOperator::Range => Err(throw_err(
+            "TypeError",
+            "ranges (..) can only be iterated with for-in",
+        )),
         BinaryOperator::Equal => match (&left, &right) {
             (Value::String(a), Value::String(b)) => Ok(Value::Logic(a.eq_ignore_ascii_case(b))),
             (Value::String(_), Value::Null) => Ok(Value::Logic(false)),
@@ -2089,6 +3458,48 @@ fn evaluate_binary(left: Value, right: Value, op: &BinaryOperator) -> Result<Val
 }
 
 fn apply_array_scalar_op(items: Vec<Value>, scalar: Value, op: &BinaryOperator) -> Result<Value, RuntimeFault> {
+    // Bitwise ops broadcast over truncated ints; arithmetic over f64.
+    if matches!(
+        op,
+        BinaryOperator::BitAnd
+            | BinaryOperator::BitOr
+            | BinaryOperator::BitXor
+            | BinaryOperator::Shl
+            | BinaryOperator::Shr
+    ) {
+        let is_shift = matches!(op, BinaryOperator::Shl | BinaryOperator::Shr);
+        let scalar_int = as_i64(match scalar {
+            Value::Number(value) => value,
+            _ => {
+                return Err(throw_err(
+                    "TypeError",
+                    format!("Array math requires a numeric scalar, got {:?}", scalar),
+                ))
+            }
+        })?;
+        let shift_amount = if is_shift {
+            check_shift_amount(scalar_int as f64)?
+        } else {
+            0
+        };
+        let mut result = Vec::with_capacity(items.len());
+        for item in items {
+            let current = match item {
+                Value::Number(value) => as_i64(value)?,
+                _ => return Err(throw_err("TypeError", "Array math only works on numeric arrays")),
+            };
+            let transformed = match op {
+                BinaryOperator::BitAnd => current & scalar_int,
+                BinaryOperator::BitOr => current | scalar_int,
+                BinaryOperator::BitXor => current ^ scalar_int,
+                BinaryOperator::Shl => current.wrapping_shl(shift_amount),
+                BinaryOperator::Shr => current.wrapping_shr(shift_amount),
+                _ => return Err(throw_err("TypeError", "Unsupported array operation")),
+            };
+            result.push(Value::Number(transformed as f64));
+        }
+        return Ok(Value::Array(result));
+    }
     let scalar_number = match scalar {
         Value::Number(value) => value,
         _ => return Err(throw_err("TypeError", format!("Array math requires a numeric scalar, got {:?}", scalar))),
@@ -2279,6 +3690,7 @@ mod tests {
             "var.add".to_string(),
             Value::Function {
                 params: vec!["a".to_string(), "b".to_string()],
+                defaults: HashMap::new(),
                 body: vec![Statement::Return {
                     value: Box::new(Value::Binary {
                         left: Box::new(Value::Variable("arg.a".to_string())),
@@ -2411,6 +3823,7 @@ mod tests {
             "var.attack".to_string(),
             Value::Function {
                 params: vec![],
+                defaults: HashMap::new(),
                 body: vec![Statement::Return {
                     value: Box::new(Value::Property {
                         target: Box::new(Value::Variable("pass".to_string())),
@@ -2496,6 +3909,7 @@ mod tests {
             "var.doSomething".to_string(),
             Value::Function {
                 params: vec!["a".to_string()],
+                defaults: HashMap::new(),
                 body: vec![Statement::Return {
                     value: Box::new(Value::Variable("arg".to_string())),
                 }],
@@ -2607,6 +4021,341 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_truth_table_and_shifts() {
+        let cases = vec![
+            ("6 & 3", 2.0),
+            ("6 | 3", 7.0),
+            ("6 ^ 3", 5.0),
+            ("~0", -1.0),
+            ("~5", -6.0),
+            ("1 << 10", 1024.0),
+            ("(0 - 8) >> 2", -2.0),
+            ("7.9 & 3.1", 3.0),
+            ("2 + 1 << 2", 12.0),
+            ("15 ^ 1 ^ 1", 15.0),
+        ];
+        for (source, expected) in cases {
+            let full = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local r number = {}\n}}\n",
+                source
+            );
+            let program = Parser::parse(&full).unwrap();
+            let body = match &program.statements[0] {
+                Statement::Event { body, .. } => body.clone(),
+                _ => panic!("expected event"),
+            };
+            let mut rt = ModuleRuntime::default();
+            let mut env = HashMap::new();
+            execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS).unwrap();
+            assert_eq!(
+                env.get("var.r"),
+                Some(&Value::Number(expected)),
+                "failed for {}",
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_errors_are_catchable() {
+        let env = HashMap::new();
+        // Non-number operand.
+        assert!(matches!(
+            eval(
+                &Value::Binary {
+                    left: Box::new(Value::String("a".to_string())),
+                    op: BinaryOperator::BitAnd,
+                    right: Box::new(Value::Number(1.0)),
+                },
+                &env,
+            ),
+            Err(RuntimeFault::Throw(_))
+        ));
+        // Negative shift.
+        assert!(matches!(
+            eval(
+                &Value::Binary {
+                    left: Box::new(Value::Number(1.0)),
+                    op: BinaryOperator::Shl,
+                    right: Box::new(Value::Number(-1.0)),
+                },
+                &env,
+            ),
+            Err(RuntimeFault::Throw(_))
+        ));
+        // Bitwise broadcasts over arrays.
+        let broadcast = eval(
+            &Value::Binary {
+                left: Box::new(Value::Array(vec![
+                    Value::Number(12.0),
+                    Value::Number(10.0),
+                ])),
+                op: BinaryOperator::BitAnd,
+                right: Box::new(Value::Number(10.0)),
+            },
+            &env,
+        )
+        .unwrap();
+        assert_eq!(
+            broadcast,
+            Value::Array(vec![Value::Number(8.0), Value::Number(10.0)])
+        );
+    }
+
+    #[test]
+    fn strict_equality_tokens_lex_and_parse() {
+        let mut lexer = Lexer::new("a === b !== c");
+        let tokens = lexer.tokenize();
+        assert!(tokens.contains(&Token::StrictEqual));
+        assert!(tokens.contains(&Token::StrictNotEqual));
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local r logic = \"Hi\" === \"hi\"\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS).unwrap();
+        assert_eq!(env.get("var.r"), Some(&Value::Logic(false)));
+    }
+
+    #[test]
+    fn assignment_and_compound_ops() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local x number = 10\n    var.x = 15\n    var.x += 5\n    var.x *= 2\n    var local pair array = [1, 2, 3]\n    var.pair[0] = 99\n    var local hero object = { health: 40 }\n    var.hero.health = 50\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        for stmt in &body {
+            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        }
+        assert_eq!(env.get("var.x"), Some(&Value::Number(40.0)));
+        assert_eq!(
+            env.get("var.pair"),
+            Some(&Value::Array(vec![
+                Value::Number(99.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ]))
+        );
+        match env.get("var.hero") {
+            Some(Value::Object(map)) => {
+                assert_eq!(map.get("health"), Some(&Value::Number(50.0)))
+            }
+            other => panic!("expected hero object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn assign_to_undeclared_is_name_error() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var.nope = 1\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        assert!(matches!(
+            execute_statement(&body[0], &mut env, &mut rt, TEST_ALIAS),
+            Err(RuntimeFault::Throw(Value::Error { error_type, .. })) if error_type == "NameError"
+        ));
+    }
+
+    #[test]
+    fn float_index_is_type_error() {
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        env.insert(
+            "var.items".to_string(),
+            Value::Array(vec![Value::Number(1.0)]),
+        );
+        let err = resolve_value(
+            &Value::Index {
+                target: Box::new(Value::Variable("var.items".to_string())),
+                index: Box::new(Value::Number(1.9)),
+            },
+            &env,
+            &mut rt,
+            TEST_ALIAS,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "TypeError"
+        ));
+    }
+
+    #[test]
+    fn switch_first_match_and_default() {
+        for (value, expected) in [
+            (Value::Number(2.0), "two"),
+            (Value::Number(9.0), "other"),
+            (Value::String("Hi".to_string()), "other"),
+        ] {
+            let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    switch (var.v) {\n        case (1) { var local r string = \"one\" }\n        case (2) { var local r string = \"two\" }\n        default { var local r string = \"other\" }\n    }\n}\n";
+            let program = Parser::parse(source).unwrap();
+            let body = match &program.statements[0] {
+                Statement::Event { body, .. } => body.clone(),
+                _ => panic!("expected event"),
+            };
+            let mut rt = ModuleRuntime::default();
+            let mut env = HashMap::new();
+            env.insert("var.v".to_string(), value);
+            for stmt in &body {
+                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+            }
+            assert_eq!(
+                env.get("var.r"),
+                Some(&Value::String(expected.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn range_for_iterates_and_range_value_errors() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local total number = 0\n    for (i in 0..5) {\n        var local total number = var.total + var.i\n    }\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        for stmt in &body {
+            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        }
+        assert_eq!(env.get("var.total"), Some(&Value::Number(10.0)));
+        // Bare range as a value is a TypeError outside for-in.
+        let env = HashMap::new();
+        assert!(matches!(
+            eval(
+                &Value::Binary {
+                    left: Box::new(Value::Number(0.0)),
+                    op: BinaryOperator::Range,
+                    right: Box::new(Value::Number(3.0)),
+                },
+                &env,
+            ),
+            Err(RuntimeFault::Throw(_))
+        ));
+    }
+
+    #[test]
+    fn string_interpolation_concats() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local name string = \"Nova\"\n    var local msg string = \"hi ${var.name}!\"\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        for stmt in &body {
+            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        }
+        assert_eq!(
+            env.get("var.msg"),
+            Some(&Value::String("hi Nova!".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_params_fill_and_missing_required_errors() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local greet function = (name = \"World\") {\n        return(arg.name)\n    }\n    var local a string = greet()\n    var local b string = greet(\"Nova\")\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        for stmt in &body {
+            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        }
+        assert_eq!(
+            env.get("var.a"),
+            Some(&Value::String("World".to_string()))
+        );
+        assert_eq!(env.get("var.b"), Some(&Value::String("Nova".to_string())));
+        // Missing required param.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local f function = (x) {\n        return(arg.x)\n    }\n    var local r number = f()\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        let mut failed = false;
+        for stmt in &body {
+            if let Err(RuntimeFault::Throw(_)) =
+                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS)
+            {
+                failed = true;
+            }
+        }
+        assert!(failed);
+    }
+
+    #[test]
+    fn infinite_recursion_is_fatal() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local loop function = () {\n        return(loop())\n    }\n    var local r number = loop()\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        let mut saw_fatal = false;
+        for stmt in &body {
+            if let Err(RuntimeFault::Fatal(_)) =
+                execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS)
+            {
+                saw_fatal = true;
+            }
+        }
+        assert!(saw_fatal);
+    }
+
+    #[test]
+    fn stdlib_spot_checks() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local a string = str.Upper(\"hey\")\n    var local b array = str.Split(\"x,y\", \",\")\n    var local c number = arr.Len(var.b)\n    var local d number = math.Sqrt(16)\n    var local e number = math.Clamp(99, 0, 10)\n    var local f array = arr.Sort([3, 1, 2])\n    var local g string = arr.Join(var.f, \"-\")\n    var local h logic = str.Contains(\"hello\", \"ell\")\n}\n";
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        for stmt in &body {
+            execute_statement(stmt, &mut env, &mut rt, TEST_ALIAS).unwrap();
+        }
+        assert_eq!(env.get("var.a"), Some(&Value::String("HEY".to_string())));
+        assert_eq!(env.get("var.c"), Some(&Value::Number(2.0)));
+        assert_eq!(env.get("var.d"), Some(&Value::Number(4.0)));
+        assert_eq!(env.get("var.e"), Some(&Value::Number(10.0)));
+        assert_eq!(
+            env.get("var.f"),
+            Some(&Value::Array(vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ]))
+        );
+        assert_eq!(
+            env.get("var.g"),
+            Some(&Value::String("1-2-3".to_string()))
+        );
+        assert_eq!(env.get("var.h"), Some(&Value::Logic(true)));
+    }
+
+    #[test]
     fn parses_global_decl_and_declare() {
         let source = "[SCRIPTTYPE KALVITA VERSION 1]\ndeclare(\"./math.kal\")\ndeclare(\"./quiet.kal\", false)\nvar global share number = 53\nkal.OnStart {\n    con.Print(var.share)\n}\n";
 
@@ -2674,6 +4423,7 @@ mod tests {
                         "var.double".to_string(),
                         Value::Function {
                             params: vec!["x".to_string()],
+                            defaults: HashMap::new(),
                             body: vec![Statement::Return {
                                 value: Box::new(Value::Binary {
                                     left: Box::new(Value::Variable("arg.x".to_string())),

@@ -18,6 +18,9 @@ pub enum Token {
     Try,
     Catch,
     Throw,
+    Switch,
+    Case,
+    Default,
     BoolLiteral(bool),
     NumberLiteral(f64),
     StringLiteral(String),
@@ -27,8 +30,21 @@ pub enum Token {
     ObjectType,
     Identifier(String),
     Assign,
+    PlusAssign,
+    MinusAssign,
+    StarAssign,
+    SlashAssign,
     Equal,
+    StrictEqual,
     NotEqual,
+    StrictNotEqual,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
+    DotDot,
     And,
     Or,
     Not,
@@ -111,20 +127,42 @@ impl Lexer {
                     tokens.push(Token::Semicolon);
                 }
                 '+' => {
-                    self.advance();
-                    tokens.push(Token::Plus);
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::PlusAssign);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::Plus);
+                    }
                 }
                 '-' => {
-                    self.advance();
-                    tokens.push(Token::Minus);
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::MinusAssign);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::Minus);
+                    }
                 }
                 '*' => {
-                    self.advance();
-                    tokens.push(Token::Asterisk);
+                    if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::StarAssign);
+                    } else {
+                        self.advance();
+                        tokens.push(Token::Asterisk);
+                    }
                 }
                 '/' => {
                     if self.peek_next() == Some('/') {
                         self.skip_line_comment();
+                    } else if self.peek_next() == Some('=') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::SlashAssign);
                     } else {
                         self.advance();
                         tokens.push(Token::Slash);
@@ -134,14 +172,23 @@ impl Lexer {
                     if self.peek_next() == Some('=') {
                         self.advance();
                         self.advance();
-                        tokens.push(Token::Equal);
+                        if self.peek() == Some('=') {
+                            self.advance();
+                            tokens.push(Token::StrictEqual);
+                        } else {
+                            tokens.push(Token::Equal);
+                        }
                     } else {
                         self.advance();
                         tokens.push(Token::Assign);
                     }
                 }
                 '>' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next() == Some('>') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::Shr);
+                    } else if self.peek_next() == Some('=') {
                         self.advance();
                         self.advance();
                         tokens.push(Token::GreaterEqual);
@@ -151,7 +198,11 @@ impl Lexer {
                     }
                 }
                 '<' => {
-                    if self.peek_next() == Some('=') {
+                    if self.peek_next() == Some('<') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::Shl);
+                    } else if self.peek_next() == Some('=') {
                         self.advance();
                         self.advance();
                         tokens.push(Token::LessEqual);
@@ -164,7 +215,12 @@ impl Lexer {
                     if self.peek_next() == Some('=') {
                         self.advance();
                         self.advance();
-                        tokens.push(Token::NotEqual);
+                        if self.peek() == Some('=') {
+                            self.advance();
+                            tokens.push(Token::StrictNotEqual);
+                        } else {
+                            tokens.push(Token::NotEqual);
+                        }
                     } else {
                         self.advance();
                         tokens.push(Token::Not);
@@ -176,7 +232,8 @@ impl Lexer {
                         self.advance();
                         tokens.push(Token::And);
                     } else {
-                        panic!("Unexpected character in lexer: '&'");
+                        self.advance();
+                        tokens.push(Token::BitAnd);
                     }
                 }
                 '|' => {
@@ -185,8 +242,17 @@ impl Lexer {
                         self.advance();
                         tokens.push(Token::Or);
                     } else {
-                        panic!("Unexpected character in lexer: '|'");
+                        self.advance();
+                        tokens.push(Token::BitOr);
                     }
+                }
+                '^' => {
+                    self.advance();
+                    tokens.push(Token::BitXor);
+                }
+                '~' => {
+                    self.advance();
+                    tokens.push(Token::BitNot);
                 }
                 ':' => {
                     self.advance();
@@ -195,6 +261,10 @@ impl Lexer {
                 '.' => {
                     if self.peek_next() == Some('/') && self.peek_next_next() == Some('/') {
                         self.skip_block_comment();
+                    } else if self.peek_next() == Some('.') {
+                        self.advance();
+                        self.advance();
+                        tokens.push(Token::DotDot);
                     } else {
                         self.advance();
                         tokens.push(Token::Dot);
@@ -228,6 +298,9 @@ impl Lexer {
                         "try" => Token::Try,
                         "catch" => Token::Catch,
                         "throw" => Token::Throw,
+                        "switch" => Token::Switch,
+                        "case" => Token::Case,
+                        "default" => Token::Default,
                         "true" => Token::BoolLiteral(true),
                         "false" => Token::BoolLiteral(false),
                         "and" => Token::And,
@@ -314,8 +387,16 @@ impl Lexer {
 
     fn read_number(&mut self) -> f64 {
         let start = self.position;
+        let mut seen_dot = false;
         while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() || ch == '.' {
+            if ch.is_ascii_digit() {
+                self.advance();
+            } else if ch == '.' {
+                // Stop before a `..` range operator; allow one fraction dot.
+                if self.peek_next() == Some('.') || seen_dot {
+                    break;
+                }
+                seen_dot = true;
                 self.advance();
             } else {
                 break;
