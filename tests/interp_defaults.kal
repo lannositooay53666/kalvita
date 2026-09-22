@@ -1,0 +1,10 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    var local name string = "Nova"
+    con.Print("hi ${var.name}!")
+    var local greet function = (who = "World") {
+        return("hey ${arg.who}")
+    }
+    con.Print(greet())
+    con.Print(greet("Lyra"))
+}

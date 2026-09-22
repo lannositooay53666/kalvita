@@ -1,0 +1,12 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    con.Print(str.Upper("hey"))
+    con.Print(str.Join(str.Split("x,y", ","), "-"))
+    con.Print(arr.Len([1, 2, 3]))
+    con.Print(arr.Join(arr.Sort([3, 1, 2]), "-"))
+    con.Print(math.Sqrt(16))
+    con.Print(math.Clamp(99, 0, 10))
+    con.Print(math.Min(3, 1, 2))
+    con.Print("1" === "1")
+    con.Print("Hi" === "hi")
+}

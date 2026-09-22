@@ -1,0 +1,4 @@
+[project]
+name = "kalvita"
+version = "0.1.0"
+main = "sample.kal"

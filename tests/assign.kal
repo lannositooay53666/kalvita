@@ -1,0 +1,14 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    var local x number = 10
+    var.x = 15
+    var.x += 5
+    var.x *= 2
+    con.Print(var.x)
+    var local pair array = [1, 2, 3]
+    var.pair[2] = 99
+    con.Print(var.pair)
+    var local hero object = { health: 40 }
+    var.hero.health = 50
+    con.Print(var.hero.health)
+}

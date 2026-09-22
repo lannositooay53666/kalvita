@@ -1,0 +1,8 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+var global share number = 53
+var global double function = (x) {
+    return(arg.x * 2)
+}
+kal.OnStart {
+    con.Print("mathx ready")
+}

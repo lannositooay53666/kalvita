@@ -1,0 +1,6 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+declare("./helpers/mathx.kal")
+kal.OnStart {
+    con.Print(mathx:var.share)
+    con.Print(mathx:double(21))
+}

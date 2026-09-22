@@ -1,0 +1,10 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    con.Print(6 & 3)
+    con.Print(6 | 3)
+    con.Print(6 ^ 3)
+    con.Print(~0)
+    con.Print(1 << 10)
+    con.Print((0 - 256) >> 4)
+    con.Print([12, 10] & 10)
+}
