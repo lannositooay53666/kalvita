@@ -1,0 +1,11 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    assert(1 + 1 == 2)
+    assert("hello" == "HELLO", "case-insensitive ==")
+    assert(arr.Len([1, 2, 3]) == 3)
+    try {
+        assert(false, "inner")
+        catch (AssertError) { con.Print(var.err.message) }
+    }
+    con.Print("all good")
+}

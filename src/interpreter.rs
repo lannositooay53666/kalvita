@@ -117,6 +117,8 @@ pub struct ModuleRuntime {
     canonical_to_alias: HashMap<PathBuf, String>,
     loading: Vec<PathBuf>,
     call_depth: Rc<Cell<usize>>,
+    db_next: u64,
+    db_conns: HashMap<u64, Rc<rusqlite::Connection>>,
 }
 
 impl Default for ModuleRuntime {
@@ -126,6 +128,8 @@ impl Default for ModuleRuntime {
             canonical_to_alias: HashMap::new(),
             loading: Vec::new(),
             call_depth: Rc::new(Cell::new(0)),
+            db_next: 1,
+            db_conns: HashMap::new(),
         }
     }
 }
@@ -886,9 +890,315 @@ fn invoke_str(
             }
             _ => Err(throw_err("ValueError", "ToNum expects exactly one string")),
         },
+        "Lines" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::Array(
+                expect_string(v, "Lines")?
+                    .lines()
+                    .map(|l| Value::String(l.to_string()))
+                    .collect(),
+            ))),
+            _ => Err(throw_err("ValueError", "Lines expects exactly one string")),
+        },
+        "Chars" => match resolved.as_slice() {
+            [v] => Ok(Some(Value::Array(
+                expect_string(v, "Chars")?
+                    .chars()
+                    .map(|c| Value::String(c.to_string()))
+                    .collect(),
+            ))),
+            _ => Err(throw_err("ValueError", "Chars expects exactly one string")),
+        },
+        "StartsWith" | "EndsWith" => match resolved.as_slice() {
+            [s, affix] => {
+                let (s, affix) = (expect_string(s, function)?, expect_string(affix, function)?);
+                Ok(Some(Value::Logic(if function == "StartsWith" {
+                    s.starts_with(affix.as_str())
+                } else {
+                    s.ends_with(affix.as_str())
+                })))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                format!("{} expects (string, affix)", function),
+            )),
+        },
+        "TrimPrefix" | "TrimSuffix" => match resolved.as_slice() {
+            [s, affix] => {
+                let (s, affix) = (expect_string(s, function)?, expect_string(affix, function)?);
+                Ok(Some(Value::String(
+                    if function == "TrimPrefix" {
+                        s.strip_prefix(affix.as_str()).unwrap_or(&s).to_string()
+                    } else {
+                        s.strip_suffix(affix.as_str()).unwrap_or(&s).to_string()
+                    },
+                )))
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                format!("{} expects (string, affix)", function),
+            )),
+        },
+        "Repeat" => match resolved.as_slice() {
+            [s, n] => {
+                let (s, n) = (expect_string(s, "Repeat")?, expect_int(n, "Repeat")?);
+                if n < 0 {
+                    return Err(throw_err("ValueError", "Repeat count must be >= 0"));
+                }
+                const MAX_REPEAT_CHARS: u64 = 10_000_000;
+                let chars = s.chars().count() as u64;
+                if chars.saturating_mul(n as u64) > MAX_REPEAT_CHARS {
+                    return Err(throw_err(
+                        "ValueError",
+                        "Repeat result would exceed 10M characters",
+                    ));
+                }
+                Ok(Some(Value::String(s.repeat(n as usize))))
+            }
+            _ => Err(throw_err("ValueError", "Repeat expects (string, count)")),
+        },
+        "ParseInt" => match resolved.as_slice() {
+            [v] => {
+                let s = expect_string(v, "ParseInt")?;
+                s.trim().parse::<i64>().map(|n| Some(Value::Number(n as f64))).map_err(|_| {
+                    throw_err("ValueError", format!("cannot convert to integer: '{}'", s))
+                })
+            }
+            _ => Err(throw_err("ValueError", "ParseInt expects exactly one string")),
+        },
+        "ParseFloat" => match resolved.as_slice() {
+            [v] => {
+                let s = expect_string(v, "ParseFloat")?;
+                s.trim()
+                    .parse::<f64>()
+                    .map(Value::Number)
+                    .map(Some)
+                    .map_err(|_| {
+                        throw_err("ValueError", format!("cannot convert to number: '{}'", s))
+                    })
+            }
+            _ => Err(throw_err("ValueError", "ParseFloat expects exactly one string")),
+        },
+        "Match" => match resolved.as_slice() {
+            [s, pat] => {
+                let (s, pat) = (expect_string(s, "Match")?, expect_string(pat, "Match")?);
+                glob_match(&pat, &s).map(Value::Logic).map(Some)
+            }
+            _ => Err(throw_err("ValueError", "Match expects (string, pattern)")),
+        },
         _ => Err(throw_err(
             "NameError",
             format!("Unknown str function: {}", function),
+        )),
+    }
+}
+
+/// Blocking HTTP via ureq (30s global timeout). Transports and
+/// non-2xx statuses surface as catchable `IOError`.
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into()
+}
+
+fn http_get(url: &str) -> Result<String, RuntimeFault> {
+    let mut response = http_agent()
+        .get(url)
+        .call()
+        .map_err(|e| throw_err("IOError", format!("GET '{}' failed: {}", url, e)))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| throw_err("IOError", format!("GET '{}' failed reading body: {}", url, e)))
+}
+
+fn http_post(url: &str, body: &str, content_type: &str) -> Result<String, RuntimeFault> {
+    let mut response = http_agent()
+        .post(url)
+        .header("Content-Type", content_type)
+        .send(body)
+        .map_err(|e| throw_err("IOError", format!("POST '{}' failed: {}", url, e)))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| throw_err("IOError", format!("POST '{}' failed reading body: {}", url, e)))
+}
+
+/// Open a SQLite database file (created when missing) and register the
+/// connection on the runtime, returning a `db` handle value.
+fn db_open(rt: &mut ModuleRuntime, path: &str) -> Result<Value, RuntimeFault> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| throw_err("DbError", format!("cannot open '{}': {}", path, e)))?;
+    let id = rt.db_next;
+    rt.db_next += 1;
+    rt.db_conns.insert(id, Rc::new(conn));
+    Ok(Value::Db { id })
+}
+
+fn db_conn(rt: &ModuleRuntime, handle: &Value, what: &str) -> Result<Rc<rusqlite::Connection>, RuntimeFault> {
+    match handle {
+        Value::Db { id } => rt.db_conns.get(id).cloned().ok_or_else(|| {
+            throw_err("DbError", format!("{}: unknown database handle (was it closed?)", what))
+        }),
+        other => Err(throw_err(
+            "TypeError",
+            format!("{} expects a db handle from db.Open, got {:?}", what, other),
+        )),
+    }
+}
+
+/// Bind a Kalvita array of params to SQLite values. Integrals stay
+/// integers, other numbers bind as floats; anything else is a `ValueError`.
+fn db_param_value(v: &Value) -> Result<rusqlite::types::Value, RuntimeFault> {
+    use rusqlite::types::Value as Sql;
+    match v {
+        Value::Null => Ok(Sql::Null),
+        Value::Logic(b) => Ok(Sql::Integer(*b as i64)),
+        Value::String(s) => Ok(Sql::Text(s.clone())),
+        Value::Number(n) => {
+            if !n.is_finite() {
+                return Err(throw_err(
+                    "ValueError",
+                    format!("cannot bind non-finite number {} to SQL", n),
+                ));
+            }
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n < 9.223372036854776e18 {
+                #[allow(clippy::cast_possible_truncation)]
+                Ok(Sql::Integer(*n as i64))
+            } else {
+                Ok(Sql::Real(*n))
+            }
+        }
+        other => Err(throw_err(
+            "TypeError",
+            format!("cannot bind {} as a SQL parameter", value_type_name(other)),
+        )),
+    }
+}
+
+fn db_row_to_object(
+    row: &rusqlite::Row,
+    names: &[String],
+) -> Result<HashMap<String, Value>, rusqlite::Error> {
+    use rusqlite::types::ValueRef as Ref;
+    let mut map = HashMap::with_capacity(names.len());
+    for (i, name) in names.iter().enumerate() {
+        let value = match row.get_ref(i)? {
+            Ref::Null => Value::Null,
+            Ref::Integer(n) => Value::Number(n as f64),
+            Ref::Real(n) => Value::Number(n),
+            Ref::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).to_string()),
+            Ref::Blob(bytes) => Value::String(String::from_utf8_lossy(bytes).to_string()),
+        };
+        map.insert(name.clone(), value);
+    }
+    Ok(map)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_db(
+    function: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Option<Value>, RuntimeFault> {
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
+    match function {
+        "Open" => match resolved.as_slice() {
+            [target] => {
+                let path = resolve_file_target(target)?;
+                db_open(rt, &path).map(Some)
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                "Open expects a path string or file variable",
+            )),
+        },
+        "Close" => match resolved.as_slice() {
+            [handle] => {
+                match handle {
+                    Value::Db { id } => {
+                        if rt.db_conns.remove(id).is_none() {
+                            return Err(throw_err(
+                                "DbError",
+                                "Close: unknown database handle (was it closed?)",
+                            ));
+                        }
+                        Ok(Some(Value::Null))
+                    }
+                    other => Err(throw_err(
+                        "TypeError",
+                        format!("Close expects a db handle, got {:?}", other),
+                    )),
+                }
+            }
+            _ => Err(throw_err("ValueError", "Close expects (db)")),
+        },
+        "Exec" => {
+            let (handle, sql, params) = match resolved.as_slice() {
+                [handle, sql] => (handle, expect_string(sql, "Exec")?, Vec::new()),
+                [handle, sql, args] => {
+                    let items = expect_array(args, "Exec")?;
+                    let bound = items
+                        .iter()
+                        .map(db_param_value)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (handle, expect_string(sql, "Exec")?, bound)
+                }
+                _ => {
+                    return Err(throw_err(
+                        "ValueError",
+                        "Exec expects (db, sql[, params])",
+                    ))
+                }
+            };
+            let conn = db_conn(rt, handle, "Exec")?;
+            conn.execute(&sql, rusqlite::params_from_iter(params))
+                .map(|_| Some(Value::Null))
+                .map_err(|e| throw_err("DbError", format!("Exec failed: {}", e)))
+        }
+        "Query" => {
+            let (handle, sql, params) = match resolved.as_slice() {
+                [handle, sql] => (handle, expect_string(sql, "Query")?, Vec::new()),
+                [handle, sql, args] => {
+                    let items = expect_array(args, "Query")?;
+                    let bound = items
+                        .iter()
+                        .map(db_param_value)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (handle, expect_string(sql, "Query")?, bound)
+                }
+                _ => {
+                    return Err(throw_err(
+                        "ValueError",
+                        "Query expects (db, sql[, params])",
+                    ))
+                }
+            };
+            let conn = db_conn(rt, handle, "Query")?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| throw_err("DbError", format!("Query failed: {}", e)))?;
+            let names: Vec<String> =
+                stmt.column_names().iter().map(|s| s.to_string()).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params), |row| {
+                    db_row_to_object(row, &names)
+                })
+                .map_err(|e| throw_err("DbError", format!("Query failed: {}", e)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(Value::Object(
+                    row.map_err(|e| throw_err("DbError", format!("Query failed: {}", e)))?,
+                ));
+            }
+            Ok(Some(Value::Array(out)))
+        }
+        _ => Err(throw_err(
+            "NameError",
+            format!("Unknown db function: {}", function),
         )),
     }
 }
@@ -931,6 +1241,35 @@ fn select_file_builtin(
     }
 }
 
+/// Bare `assert(cond[, msg])`: passes through (`null`) when `cond` is
+/// truthy, throws a catchable `AssertError` otherwise. Powers
+/// assertion-style tests: a passing file prints nothing, a failing one
+/// aborts with `Runtime error: Uncaught AssertError: <msg>`.
+fn assert_builtin(
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Value, RuntimeFault> {
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
+    let (cond, msg) = match resolved.as_slice() {
+        [cond] => (cond, "assertion failed".to_string()),
+        [cond, msg] => (cond, stringify_value(msg)),
+        _ => {
+            return Err(throw_err(
+                "ValueError",
+                "assert expects (condition[, message])",
+            ))
+        }
+    };
+    if is_truthy(cond) {
+        Ok(Value::Null)
+    } else {
+        Err(throw_err("AssertError", msg))
+    }
+}
+
 fn substring(s: String, start: i64, len: Option<i64>) -> Result<String, RuntimeFault> {
     if start < 0 {
         return Err(throw_err("ValueError", "Sub start must be >= 0"));
@@ -947,6 +1286,186 @@ fn substring(s: String, start: i64, len: Option<i64>) -> Result<String, RuntimeF
         None => chars.len(),
     };
     Ok(chars[start..end].iter().collect())
+}
+
+/// Format unix milliseconds (UTC) with tokens `YYYY MM DD HH mm SS`.
+/// Unknown text passes through untouched.
+fn format_unix_millis(millis: i64, pattern: &str) -> String {
+    let secs = millis.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let time = secs.rem_euclid(86_400);
+    // Howard Hinnant's days-to-civil (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    pattern
+        .replace("YYYY", &format!("{:04}", year))
+        .replace("MM", &format!("{:02}", m))
+        .replace("DD", &format!("{:02}", d))
+        .replace("HH", &format!("{:02}", time / 3_600))
+        .replace("mm", &format!("{:02}", (time % 3_600) / 60))
+        .replace("SS", &format!("{:02}", time % 60))
+}
+
+/// Convert `serde_json::Value` into Kalvita values. Objects become
+/// `object`, arrays become `array`, numbers/bools/null map directly.
+/// Depth-capped so hostile nesting is a `ValueError`, not a stack overflow.
+fn json_to_value(v: &serde_json::Value, depth: usize) -> Result<Value, RuntimeFault> {
+    const MAX_JSON_DEPTH: usize = 128;
+    if depth > MAX_JSON_DEPTH {
+        return Err(throw_err("ValueError", "JSON nesting exceeds 128 levels"));
+    }
+    match v {
+        serde_json::Value::Null => Ok(Value::Null),
+        serde_json::Value::Bool(b) => Ok(Value::Logic(*b)),
+        serde_json::Value::Number(n) => n
+            .as_f64()
+            .map(Value::Number)
+            .ok_or_else(|| throw_err("ValueError", format!("JSON number out of range: {}", n))),
+        serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| json_to_value(item, depth + 1))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, item)| json_to_value(item, depth + 1).map(|value| (k.clone(), value)))
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map(Value::Object),
+    }
+}
+
+/// Convert Kalvita values back to JSON. Object keys are sorted for
+/// deterministic output. Functions, files, and errors cannot cross
+/// the boundary and are a `ValueError`.
+fn value_to_json(v: &Value, depth: usize) -> Result<serde_json::Value, String> {
+    const MAX_JSON_DEPTH: usize = 128;
+    if depth > MAX_JSON_DEPTH {
+        return Err("value nesting exceeds 128 levels".to_string());
+    }
+    match v {
+        Value::Null => Ok(serde_json::Value::Null),
+        Value::Logic(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Number(n) => serde_json::Number::from_f64(*n)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| format!("cannot stringify non-finite number: {}", n)),
+        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| value_to_json(item, depth + 1))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for k in keys {
+                out.insert(k.clone(), value_to_json(&map[k], depth + 1)?);
+            }
+            Ok(serde_json::Value::Object(out))
+        }
+        other => Err(format!(
+            "cannot stringify {} to JSON (only string/number/logic/null/array/object cross the boundary)",
+            value_type_name(other)
+        )),
+    }
+}
+
+/// Glob match (`*` any run, `?` one char, `[...]` class, `\` escape).
+/// Must consume the whole string. Unclosed `[` is a `ValueError`.
+fn glob_match(pattern: &str, text: &str) -> Result<bool, RuntimeFault> {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    glob_here(&p, 0, &t, 0)
+}
+
+fn glob_here(p: &[char], pi: usize, t: &[char], ti: usize) -> Result<bool, RuntimeFault> {
+    if pi == p.len() {
+        return Ok(ti == t.len());
+    }
+    match p[pi] {
+        '*' => {
+            let mut k = ti;
+            loop {
+                if glob_here(p, pi + 1, t, k)? {
+                    return Ok(true);
+                }
+                if k == t.len() {
+                    return Ok(false);
+                }
+                k += 1;
+            }
+        }
+        '?' => {
+            if ti == t.len() {
+                return Ok(false);
+            }
+            glob_here(p, pi + 1, t, ti + 1)
+        }
+        '[' => {
+            if ti == t.len() {
+                return Ok(false);
+            }
+            let mut j = pi + 1;
+            let mut negate = false;
+            if j < p.len() && p[j] == '^' {
+                negate = true;
+                j += 1;
+            }
+            let mut matched = negate;
+            let mut closed = false;
+            let mut first = true; // a `]` in first position is a literal
+            while j < p.len() {
+                if p[j] == ']' && !first {
+                    closed = true;
+                    j += 1;
+                    break;
+                }
+                first = false;
+                if j + 2 < p.len() && p[j + 1] == '-' && p[j + 2] != ']' {
+                    if p[j] <= t[ti] && t[ti] <= p[j + 2] {
+                        matched = !negate;
+                    }
+                    j += 3;
+                } else {
+                    if p[j] == t[ti] {
+                        matched = !negate;
+                    }
+                    j += 1;
+                }
+            }
+            if !closed {
+                return Err(throw_err("ValueError", "Match pattern has unclosed '['"));
+            }
+            if !matched {
+                return Ok(false);
+            }
+            glob_here(p, j, t, ti + 1)
+        }
+        '\\' => {
+            if pi + 1 >= p.len() {
+                return Err(throw_err("ValueError", "Match pattern ends with '\\'"));
+            }
+            if ti == t.len() || t[ti] != p[pi + 1] {
+                return Ok(false);
+            }
+            glob_here(p, pi + 2, t, ti + 1)
+        }
+        c => {
+            if ti == t.len() || t[ti] != c {
+                return Ok(false);
+            }
+            glob_here(p, pi + 1, t, ti + 1)
+        }
+    }
 }
 
 fn invoke_arr(
@@ -1221,11 +1740,11 @@ fn invoke_function(
         Some(obj) if obj == "str" => invoke_str(function, args, environment, types, rt, cur),
         Some(obj) if obj == "arr" => invoke_arr(function, args, environment, types, rt, cur),
         Some(obj) if obj == "time" => {
-            if !args.is_empty() {
-                return Err(throw_err("ValueError", "Now expects no arguments"));
-            }
             match function {
                 "Now" => {
+                    if !args.is_empty() {
+                        return Err(throw_err("ValueError", "Now expects no arguments"));
+                    }
                     use std::time::{SystemTime, UNIX_EPOCH};
                     let millis = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -1234,12 +1753,139 @@ fn invoke_function(
                     #[allow(clippy::cast_precision_loss)]
                     Ok(Some(Value::Number(millis as f64)))
                 }
+                "Format" => {
+                    let resolved = resolve_args(args, environment, types, rt, cur)?;
+                    let (millis, pattern) = match resolved.as_slice() {
+                        [ms] => (expect_number(ms, "Format")?, "YYYY-MM-DD HH:mm:SS".to_string()),
+                        [ms, pat] => (
+                            expect_number(ms, "Format")?,
+                            expect_string(pat, "Format")?,
+                        ),
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Format expects (milliseconds[, pattern])",
+                            ))
+                        }
+                    };
+                    if !millis.is_finite() || millis < 0.0 {
+                        return Err(throw_err(
+                            "ValueError",
+                            format!("Format expects non-negative milliseconds, got {}", millis),
+                        ));
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    Ok(Some(Value::String(format_unix_millis(
+                        millis as i64,
+                        &pattern,
+                    ))))
+                }
                 _ => Err(throw_err(
                     "NameError",
                     format!("Unknown time function: {}", function),
                 )),
             }
         }
+        Some(obj) if obj == "json" => {
+            let resolved = resolve_args(args, environment, types, rt, cur)?;
+            match function {
+                "Parse" => match resolved.as_slice() {
+                    [s] => {
+                        let s = expect_string(s, "Parse")?;
+                        serde_json::from_str::<serde_json::Value>(&s)
+                            .map_err(|e| {
+                                throw_err("ValueError", format!("invalid JSON: {}", e))
+                            })
+                            .and_then(|v| json_to_value(&v, 0))
+                            .map(Some)
+                    }
+                    _ => Err(throw_err("ValueError", "Parse expects (json_string)")),
+                },
+                "Stringify" => match resolved.as_slice() {
+                    [v] => value_to_json(v, 0)
+                        .map(|j| Some(Value::String(j.to_string())))
+                        .map_err(|e| throw_err("ValueError", e)),
+                    _ => Err(throw_err("ValueError", "Stringify expects (value)")),
+                },
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown json function: {}", function),
+                )),
+            }
+        }
+        Some(obj) if obj == "sys" => {            let resolved = resolve_args(args, environment, types, rt, cur)?;
+            match function {
+                "Args" => {
+                    if !resolved.is_empty() {
+                        return Err(throw_err("ValueError", "Args expects no arguments"));
+                    }
+                    Ok(Some(Value::Array(
+                        std::env::args().map(Value::String).collect(),
+                    )))
+                }
+                "Getenv" => match resolved.as_slice() {
+                    [name] => {
+                        let name = expect_string(name, "Getenv")?;
+                        Ok(Some(
+                            std::env::var(&name).map(Value::String).unwrap_or(Value::Null),
+                        ))
+                    }
+                    _ => Err(throw_err("ValueError", "Getenv expects (name)")),
+                },
+                "Cwd" => {
+                    if !resolved.is_empty() {
+                        return Err(throw_err("ValueError", "Cwd expects no arguments"));
+                    }
+                    std::env::current_dir()
+                        .map(|p| Some(Value::String(p.display().to_string())))
+                        .map_err(|e| throw_err("IOError", format!("cannot read cwd: {}", e)))
+                }
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown sys function: {}", function),
+                )),
+            }
+        }
+        Some(obj) if obj == "http" => {
+            let resolved = resolve_args(args, environment, types, rt, cur)?;
+            match function {
+                "Get" => match resolved.as_slice() {
+                    [url] => {
+                        let url = expect_string(url, "Get")?;
+                        http_get(&url).map(|body| Some(Value::String(body)))
+                    }
+                    _ => Err(throw_err("ValueError", "Get expects (url)")),
+                },
+                "Post" => match resolved.as_slice() {
+                    [url, body] => {
+                        let (url, body) = (
+                            expect_string(url, "Post")?,
+                            stringify_value(body),
+                        );
+                        http_post(&url, &body, "text/plain")
+                            .map(|resp| Some(Value::String(resp)))
+                    }
+                    [url, body, content_type] => {
+                        let (url, body, content_type) = (
+                            expect_string(url, "Post")?,
+                            stringify_value(body),
+                            expect_string(content_type, "Post")?,
+                        );
+                        http_post(&url, &body, &content_type)
+                            .map(|resp| Some(Value::String(resp)))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "Post expects (url, body[, content_type])",
+                    )),
+                },
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown http function: {}", function),
+                )),
+            }
+        }
+        Some(obj) if obj == "db" => invoke_db(function, args, environment, types, rt, cur),
         Some(obj) if obj == "file" => {
             let resolved: Vec<Value> = args
                 .iter()
@@ -1274,6 +1920,97 @@ fn invoke_function(
                     fs::write(&path, content)
                         .map(|()| Some(Value::Null))
                         .map_err(|e| throw_err("IOError", format!("cannot write '{}': {}", path, e)))
+                }
+                "Append" => {
+                    let (path, content) = match resolved.as_slice() {
+                        [target, content] => (resolve_file_target(target)?, stringify_value(content)),
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Append expects a path string or file variable, plus content",
+                            ))
+                        }
+                    };
+                    use std::fs::OpenOptions;
+                    use std::io::Write as _;
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .and_then(|mut f| f.write_all(content.as_bytes()))
+                        .map(|()| Some(Value::Null))
+                        .map_err(|e| throw_err("IOError", format!("cannot append '{}': {}", path, e)))
+                }
+                "Exists" => match resolved.as_slice() {
+                    [target] => {
+                        let path = resolve_file_target(target)?;
+                        Ok(Some(Value::Logic(Path::new(&path).exists())))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "Exists expects a path string or file variable",
+                    )),
+                },
+                "Remove" => match resolved.as_slice() {
+                    [target] => {
+                        let path = resolve_file_target(target)?;
+                        let target_path = Path::new(&path);
+                        let result = if target_path.is_dir() {
+                            fs::remove_dir(&path)
+                        } else {
+                            fs::remove_file(&path)
+                        };
+                        result
+                            .map(|()| Some(Value::Null))
+                            .map_err(|e| throw_err("IOError", format!("cannot remove '{}': {}", path, e)))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "Remove expects a path string or file variable",
+                    )),
+                },
+                "ListDir" => {
+                    let path = match resolved.as_slice() {
+                        [] => ".".to_string(),
+                        [target] => resolve_file_target(target)?,
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "ListDir expects zero or one path",
+                            ))
+                        }
+                    };
+                    fs::read_dir(&path)
+                        .map_err(|e| throw_err("IOError", format!("cannot list '{}': {}", path, e)))?
+                        .map(|entry| {
+                            entry
+                                .map(|e| {
+                                    Value::String(e.file_name().to_string_lossy().to_string())
+                                })
+                                .map_err(|e| {
+                                    throw_err("IOError", format!("cannot list '{}': {}", path, e))
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|mut names| {
+                            names.sort_by(|a, b| match (a, b) {
+                                (Value::String(x), Value::String(y)) => x.cmp(y),
+                                _ => std::cmp::Ordering::Equal,
+                            });
+                            Some(Value::Array(names))
+                        })
+                }
+                "MkDir" => match resolved.as_slice() {
+                    [target] => {
+                        let path = resolve_file_target(target)?;
+                        fs::create_dir_all(&path)
+                            .map(|()| Some(Value::Null))
+                            .map_err(|e| throw_err("IOError", format!("cannot create dir '{}': {}", path, e)))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "MkDir expects a path string or file variable",
+                    )),
                 }
                 _ => Err(throw_err(
                     "NameError",
@@ -1322,6 +2059,15 @@ fn invoke_function(
                         && object.is_none() =>
                 {
                     return select_file_builtin(args, environment, types, rt, cur).map(Some);
+                }
+                // Bare `assert(cond[, msg])`: truthy passes, falsy throws a
+                // catchable `AssertError`. Same precedence rule as selectFile.
+                Err(RuntimeFault::Throw(Value::Error { error_type, .. }))
+                    if error_type == "NameError"
+                        && function == "assert"
+                        && object.is_none() =>
+                {
+                    return assert_builtin(args, environment, types, rt, cur).map(Some);
                 }
                 Err(other) => return Err(other),
             };
@@ -1384,6 +2130,7 @@ fn check_type(slot: &str, type_name: &str, value: &Value) -> Result<(), RuntimeF
         ("array", Value::Array(_)) => true,
         ("object", Value::Object(_)) => true,
         ("file", Value::File { .. }) => true,
+        ("db", Value::Db { .. }) => true,
         ("function", Value::Function { .. }) => true,
         _ => false,
     };
@@ -1411,6 +2158,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Variable(_) => "variable",
         Value::Object(_) => "object",
         Value::File { .. } => "file",
+        Value::Db { .. } => "db",
         Value::Array(_) => "array",
         Value::Index { .. } => "index",
         Value::FunctionCall { .. } => "function-call",
@@ -2361,6 +3109,7 @@ fn format_value(value: Value) -> String {
         Value::Variable(v) => v,
         Value::Error { error_type, message } => format!("{}: {}", error_type, message),
         Value::File { path } => format!("file({})", path),
+        Value::Db { id } => format!("db({})", id),
         Value::Array(items) => {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
@@ -3117,19 +3866,34 @@ mod tests {
 
     #[test]
     fn infinite_recursion_is_fatal() {
-        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local loop function = () {\n        return(loop())\n    }\n    var local r number = loop()\n}\n";
-        let program = Parser::parse(source).unwrap();
-        let body = match &program.statements[0] {
-            Statement::Event { body, .. } => body.clone(),
-            _ => panic!("expected event"),
-        };
-        let mut env = HashMap::new();
-        let mut saw_fatal = false;
-        for stmt in &body {
-            if let Err(RuntimeFault::Fatal(_)) = try_stmt(stmt, &mut env) {
-                saw_fatal = true;
-            }
-        }
+        // Runs on a roomy stack: this asserts language semantics (the
+        // depth guard fires with a fatal error), not native stack
+        // consumption, which legitimately grows as builtins are added.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local loop function = () {\n        return(loop())\n    }\n    var local r number = loop()\n}\n"
+        .to_string();
+        let saw_fatal = std::thread::Builder::new()
+            .name("recursion-guard".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let program = Parser::parse(&source).unwrap();
+                let body = match &program.statements[0] {
+                    Statement::Event { body, .. } => body.clone(),
+                    _ => panic!("expected event"),
+                };
+                let mut env = HashMap::new();
+                let mut saw_fatal = false;
+                for stmt in &body {
+                    if let Err(RuntimeFault::Fatal(_)) =
+                        execute_statement(stmt, &mut env, &mut HashMap::new(), &mut ModuleRuntime::default(), TEST_ALIAS)
+                    {
+                        saw_fatal = true;
+                    }
+                }
+                saw_fatal
+            })
+            .unwrap()
+            .join()
+            .unwrap();
         assert!(saw_fatal);
     }
 
@@ -3521,5 +4285,309 @@ mod tests {
             Some(&Value::String("legacy".to_string()))
         );
         let _ = std::fs::remove_file(&target);
+    }
+
+    #[test]
+    fn sys_builtins_read_process() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local argv array = sys.Args()\n    var local missing null = sys.Getenv(\"KALVITA_DEFINITELY_MISSING_XYZ\")\n    var local cwd string = sys.Cwd()\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert!(matches!(env.get("var.argv"), Some(Value::Array(_))));
+        assert_eq!(env.get("var.missing"), Some(&Value::Null));
+        assert!(matches!(env.get("var.cwd"), Some(Value::String(s)) if !s.is_empty()));
+        // Arity errors.
+        for stmt in [
+            "sys.Args(1)",
+            "sys.Getenv()",
+            "sys.Getenv(1, 2)",
+            "sys.Cwd(\".\")",
+            "sys.Nope()",
+        ] {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    {}\n}}\n",
+                stmt
+            );
+            let (_, err) = run_with_types(&source);
+            assert!(err.is_some(), "{} should fail", stmt);
+        }
+    }
+
+    #[test]
+    fn time_format_known_dates() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local epoch string = time.Format(0)\n    var local y2021 string = time.Format(1609459200000)\n    var local custom string = time.Format(0, \"DD/MM/YYYY HH:mm\")\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.epoch"),
+            Some(&Value::String("1970-01-01 00:00:00".to_string()))
+        );
+        assert_eq!(
+            env.get("var.y2021"),
+            Some(&Value::String("2021-01-01 00:00:00".to_string()))
+        );
+        assert_eq!(
+            env.get("var.custom"),
+            Some(&Value::String("01/01/1970 00:00".to_string()))
+        );
+        for stmt in ["time.Format(0 - 1)", "time.Format(\"x\")", "time.Format(0, \"x\", 1)"] {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    {}\n}}\n",
+                stmt
+            );
+            let (_, err) = run_with_types(&source);
+            assert!(err.is_some(), "{} should fail", stmt);
+        }
+    }
+
+    #[test]
+    fn str_new_builtins() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local lines array = str.Lines(\"a\\nb\\nc\")\n    var local chars array = str.Chars(\"hey\")\n    var local sw logic = str.StartsWith(\"hello\", \"he\")\n    var local ew logic = str.EndsWith(\"hello\", \"lo\")\n    var local tp string = str.TrimPrefix(\"xxhey\", \"xx\")\n    var local ts string = str.TrimSuffix(\"heyzz\", \"zz\")\n    var local rep string = str.Repeat(\"ab\", 3)\n    var local pi number = str.ParseInt(\"  -42 \")\n    var local pf number = str.ParseFloat(\"3.5\")\n    var local m logic = str.Match(\"hello.txt\", \"*.txt\")\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.lines"),
+            Some(&Value::Array(vec![
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+                Value::String("c".to_string()),
+            ]))
+        );
+        assert_eq!(env.get("var.sw"), Some(&Value::Logic(true)));
+        assert_eq!(env.get("var.ew"), Some(&Value::Logic(true)));
+        assert_eq!(env.get("var.tp"), Some(&Value::String("hey".to_string())));
+        assert_eq!(env.get("var.ts"), Some(&Value::String("hey".to_string())));
+        assert_eq!(env.get("var.rep"), Some(&Value::String("ababab".to_string())));
+        assert_eq!(env.get("var.pi"), Some(&Value::Number(-42.0)));
+        assert_eq!(env.get("var.pf"), Some(&Value::Number(3.5)));
+        assert_eq!(env.get("var.m"), Some(&Value::Logic(true)));
+        // Error cases leave no residue and report typed faults.
+        let cases = [
+            ("str.Repeat(\"x\", 0 - 1)", "ValueError"),
+            ("str.Repeat(\"x\", 99999999999)", "ValueError"),
+            ("str.ParseInt(\"12x\")", "ValueError"),
+            ("str.ParseFloat(\"nan!\")", "ValueError"),
+            ("str.Match(\"a\", \"[unclosed\")", "ValueError"),
+            ("str.Match(\"trail\", \"trail\\\\\")", "ValueError"),
+            ("str.Lines(1)", "TypeError"),
+        ];
+        for (stmt, want) in cases {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    {}\n}}\n",
+                stmt
+            );
+            let (_, err) = run_with_types(&source);
+            let err = err.unwrap_or_else(|| panic!("{} should fail", stmt));
+            assert!(err.starts_with(want), "{}: got {}", stmt, err);
+        }
+    }
+
+    #[test]
+    fn str_match_glob_table() {
+        let cases = [
+            ("*", "anything", true),
+            ("?.txt", "a.txt", true),
+            ("?.txt", "ab.txt", false),
+            ("h[ae]llo", "hello", true),
+            ("h[ae]llo", "hallo", true),
+            ("h[ae]llo", "hullo", false),
+            ("h[^ae]llo", "hullo", true),
+            ("[a-c]x", "bx", true),
+            ("[]]x", "]x", true),
+            ("a\\*b", "a*b", true),
+            ("a\\*b", "axb", false),
+            ("*.txt", "a.txt", true),
+            ("*.txt", "a.txt.bak", false),
+        ];
+        for (pat, text, want) in cases {
+            // Re-escape backslashes: Kal string literals process `\\`
+            // themselves, so a glob `\` needs `\\` in the source text.
+            let kal_pat = pat.replace('\\', "\\\\");
+            let kal_text = text.replace('\\', "\\\\");
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local m logic = str.Match(\"{}\", \"{}\")\n}}\n",
+                kal_text, kal_pat
+            );
+            let (env, err) = run_with_types(&source);
+            assert!(err.is_none(), "{:?} on {:?}: {:?}", pat, text, err);
+            assert_eq!(env.get("var.m"), Some(&Value::Logic(want)), "{:?} on {:?}", pat, text);
+        }
+    }
+
+    #[test]
+    fn file_new_builtins_round_trip() {
+        let dir = std::env::temp_dir().join("kalvita_fileops_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dir_s = dir.display().to_string().replace('\\', "/");
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local base string = \"{dir_s}\"\n    var local f string = \"${{var.base}}/note.txt\"\n    file.Write(var.f, \"hi\")\n    file.Append(var.f, \"-there\")\n    var local back string = file.Read(var.f)\n    var local here logic = file.Exists(var.f)\n    var local gone logic = file.Exists(\"${{var.base}}/nope.txt\")\n    file.MkDir(\"${{var.base}}/sub/deep\")\n    var local names array = file.ListDir(var.base)\n    var local has logic = arr.Has(var.names, \"note.txt\")\n    file.Remove(var.f)\n    var local gone2 logic = file.Exists(var.f)\n}}\n",
+        );
+        let (env, err) = run_with_types(&source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.back"),
+            Some(&Value::String("hi-there".to_string()))
+        );
+        assert_eq!(env.get("var.here"), Some(&Value::Logic(true)));
+        assert_eq!(env.get("var.gone"), Some(&Value::Logic(false)));
+        assert_eq!(env.get("var.has"), Some(&Value::Logic(true)));
+        assert_eq!(env.get("var.gone2"), Some(&Value::Logic(false)));
+        // Missing paths are catchable IOError, not fatal.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    file.Read(\"/definitely/missing/kalvita_xyz.txt\")\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("IOError"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn assert_passes_and_throws() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    assert(1 + 1 == 2)\n    assert(\"x\", \"custom\")\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    assert(false, \"boom-msg\")\n}\n";
+        let (_, err) = run_with_types(source);
+        assert_eq!(err.unwrap(), "AssertError: boom-msg");
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    try {\n        assert(0)\n        catch (AssertError) { con.Print(var.err.message) }\n    }\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.is_none(), "AssertError must be catchable: {:?}", err);
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    assert()\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("ValueError"));
+    }
+
+    #[test]
+    fn json_round_trip_and_errors() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local cfg object = json.Parse(\"{\\\"name\\\": \\\"kal\\\", \\\"n\\\": 3, \\\"tags\\\": [\\\"a\\\"], \\\"ok\\\": true, \\\"x\\\": null}\")\n    var local out string = json.Stringify(var.cfg)\n    var local nums array = json.Parse(\"[1, 2.5]\")\n}\n";
+        let (env, err) = run_with_types(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.out"),
+            Some(&Value::String(
+                "{\"n\":3.0,\"name\":\"kal\",\"ok\":true,\"tags\":[\"a\"],\"x\":null}".to_string()
+            ))
+        );
+        assert_eq!(
+            env.get("var.nums"),
+            Some(&Value::Array(vec![Value::Number(1.0), Value::Number(2.5)]))
+        );
+        for (stmt, want) in [
+            ("json.Parse(\"{bad\")", "ValueError"),
+            ("json.Parse(1)", "TypeError"),
+            ("json.Stringify(1, 2)", "ValueError"),
+        ] {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    {}\n}}\n",
+                stmt
+            );
+            let (_, err) = run_with_types(&source);
+            let err = err.unwrap_or_else(|| panic!("{} should fail", stmt));
+            assert!(err.starts_with(want), "{}: got {}", stmt, err);
+        }
+        // Functions cannot cross the JSON boundary.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local f function = (a) { return(arg.a) }\n    json.Stringify(var.f)\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("ValueError"));
+    }
+
+    #[test]
+    fn db_open_exec_query_close() {
+        let dir = std::env::temp_dir().join("kalvita_db_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("t.db");
+        let _ = std::fs::remove_file(&target);
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local db db = db.Open(\"{}\")\n    db.Exec(var.db, \"CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT, score REAL)\")\n    db.Exec(var.db, \"INSERT INTO u (name, score) VALUES (?, ?)\", [\"nova\", 9.5])\n    db.Exec(var.db, \"INSERT INTO u (name, score) VALUES (?, ?)\", [\"kael\", 7])\n    var local rows array = db.Query(var.db, \"SELECT name, score FROM u WHERE score > ?\", [8])\n    var local count number = arr.Len(var.rows)\n    var local first object = var.rows[0]\n    var local who string = var.first.name\n    db.Close(var.db)\n}}\n",
+            target.display()
+        );
+        let (env, err) = run_with_types(&source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(env.get("var.count"), Some(&Value::Number(1.0)));
+        assert_eq!(env.get("var.who"), Some(&Value::String("nova".to_string())));
+        assert!(matches!(env.get("var.db"), Some(Value::Db { .. })));
+        // Bad SQL, closed handles, and mistyped binds are typed faults.
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local db db = db.Open(\"{}\")\n    db.Query(var.db, \"SELECT * FROM nope\")\n}}\n",
+            target.display()
+        );
+        let (_, err) = run_with_types(&source);
+        assert!(err.unwrap().starts_with("DbError"));
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local db db = db.Open(\"{}\")\n    db.Close(var.db)\n    db.Query(var.db, \"SELECT 1\")\n}}\n",
+            target.display()
+        );
+        let (_, err) = run_with_types(&source);
+        assert!(err.unwrap().starts_with("DbError"));
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local db db = 1\n}\n";
+        let (_, err) = run_with_types(source);
+        assert!(err.unwrap().starts_with("TypeError"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn http_get_post_and_status_errors() {
+        use std::io::{Read, Write};
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buf = vec![0u8; 4096];
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body_len = req
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                let split = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+                let mut body = req.as_bytes()[split..].to_vec();
+                while body.len() < body_len {
+                    let mut extra = vec![0u8; 1024];
+                    let Ok(m) = stream.read(&mut extra) else {
+                        break;
+                    };
+                    if m == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&extra[..m]);
+                }
+                let first_line = req.lines().next().unwrap_or("").to_string();
+                let payload: Vec<u8> = if first_line.starts_with("GET /ok") {
+                    b"{\"hello\":\"world\"}".to_vec()
+                } else if first_line.starts_with("POST /echo") {
+                    [b"echo:".as_slice(), &body].concat()
+                } else {
+                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found";
+                    let _ = stream.write_all(resp.as_bytes());
+                    continue;
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(&payload);
+            }
+        });
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    var local body string = http.Get(\"http://127.0.0.1:{port}/ok\")\n    var local back string = http.Post(\"http://127.0.0.1:{port}/echo\", \"abc\")\n}}\n",
+        );
+        let (env, err) = run_with_types(&source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(
+            env.get("var.body"),
+            Some(&Value::String("{\"hello\":\"world\"}".to_string()))
+        );
+        assert_eq!(env.get("var.back"), Some(&Value::String("echo:abc".to_string())));
+        let source = format!(
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    http.Get(\"http://127.0.0.1:{port}/missing\")\n}}\n",
+        );
+        let (_, err) = run_with_types(&source);
+        assert!(err.unwrap().starts_with("IOError"));
     }
 }

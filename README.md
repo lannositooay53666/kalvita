@@ -21,6 +21,7 @@ cargo run -- check file.kal     # parse only
 cargo run -- fmt file.kal       # print formatted source (or --write)
 cargo run -- test tests         # golden tests (*.kal vs *.expected)
 cargo run -- repl               # interactive session (:help, :clear, :quit)
+cargo run -- <script>           # kal.toml [scripts] shortcut
 cargo test                      # Rust unit tests
 ```
 
@@ -44,8 +45,11 @@ Bare `cargo run` uses `kal.toml`'s `main`, else `sample.kal`.
   (`{type, message}`) and `throw(MyErr, "boom")`.
 * Bitwise `& | ^ ~ << >>`, ranges `0..10`, `"hi ${var.name}"` interpolation,
   strict `===` alongside case-insensitive `==`.
-* Builtins: `con.Print/Input`, `math.*`, `str.*`, `arr.*`, `time.Now`,
-  `file.Read/Write`.
+* Builtins: `con.Print/Input`, `math.*`, `str.*` (incl. `Match` glob,
+  `Lines`, `ParseInt`), `arr.*`, `time.Now/Format`, `file.Read/Write/Append/
+  Exists/ListDir/MkDir/Remove`, `sys.Args/Getenv/Cwd`, `json.Parse/Stringify`,
+  `http.Get/Post`, `db.Open/Exec/Query/Close`, bare `assert(cond[, msg])`
+  (catchable `AssertError`).
 
 The full reference lives in [SPEC.md](SPEC.md); runnable examples in
 `sample.kal` and `tests/`.
@@ -55,7 +59,7 @@ The full reference lives in [SPEC.md](SPEC.md); runnable examples in
 ```
 src/lexer.rs         tokens (keywords, numbers, strings, comments)
 src/parser.rs        AST + parser (precedence, desugar, validation)
-src/interpreter.rs   tree-walk runtime (modules, builtins, 38 unit tests)
+src/interpreter.rs   tree-walk runtime (modules, builtins, unit tests)
 src/error.rs         RuntimeFault: fatal vs catchable errors
 src/main.rs          CLI: run/check/fmt/test/repl
 tests/               golden scripts (*.kal vs *.expected)

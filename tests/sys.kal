@@ -1,0 +1,8 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    con.Print(arr.Len(sys.Args()))
+    con.Print(sys.Getenv("KALVITA_DEFINITELY_MISSING_XYZ"))
+    assert(arr.Len(sys.Args()) == 3, "harness passes [exe, run, file]")
+    assert(sys.Getenv("KALVITA_DEFINITELY_MISSING_XYZ") == null, "missing env is null")
+    con.Print("sys ok")
+}

@@ -1,0 +1,24 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    con.Print(str.Lines("a\nb\nc"))
+    con.Print(str.Chars("hey"))
+    con.Print(str.StartsWith("hello", "he"))
+    con.Print(str.EndsWith("hello", "lo"))
+    con.Print(str.TrimPrefix("xxhey", "xx"))
+    con.Print(str.TrimSuffix("heyzz", "zz"))
+    con.Print(str.Repeat("ab", 3))
+    con.Print(str.ParseInt("  -42 "))
+    con.Print(str.ParseFloat("3.5"))
+    con.Print(str.Match("hello.txt", "*.txt"))
+    con.Print(str.Match("hello", "h[ae]llo"))
+    con.Print(time.Format(0))
+    con.Print(time.Format(1609459200000, "YYYY-MM-DD"))
+    var local cfg object = json.Parse("{\"name\": \"kal\", \"n\": 3}")
+    con.Print(var.cfg.name)
+    con.Print(json.Stringify(var.cfg))
+    con.Print(json.Parse("[1, \"x\", true, null]"))
+    try {
+        json.Parse("{bad")
+        catch (ValueError) { con.Print("caught-json") }
+    }
+}

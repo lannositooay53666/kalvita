@@ -15,7 +15,8 @@ fn usage() -> String {
      kalvita check <file.kal>     parse only, report errors\n  \
      kalvita fmt <file.kal> [--write]  print (or rewrite) formatted source\n  \
      kalvita test [dir]          run golden tests (default: tests/)\n  \
-     kalvita repl                interactive session"
+     kalvita repl                interactive session\n  \
+     kalvita <script> [args...]  run a kal.toml [scripts] shortcut"
         .to_string()
 }
 
@@ -36,6 +37,49 @@ fn project_main(dir: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Look up `name` in the `[scripts]` table of `dir/kal.toml`.
+/// Returns the whitespace-split command, or `None` when absent.
+/// A present-but-malformed entry (not `name = "..."`) yields `Some(vec![])`
+/// so the caller can report it instead of silently ignoring it.
+fn project_script(dir: &Path, name: &str) -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(dir.join("kal.toml")).ok()?;
+    let mut in_scripts = false;
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_scripts = line == "[scripts]";
+            continue;
+        }
+        if !in_scripts {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        let value = value.trim();
+        if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+            return Some(
+                value[1..value.len() - 1]
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
+        return Some(Vec::new());
+    }
+    None
+}
+
+fn is_builtin_command(word: &str) -> bool {
+    matches!(word, "run" | "check" | "fmt" | "test" | "repl" | "help")
 }
 
 fn default_entry() -> PathBuf {
@@ -361,10 +405,41 @@ fn main() {
     let raw: Vec<String> = env::args().skip(1).collect();
     let debug_tokens = raw.iter().any(|a| a == "--debug-tokens");
     let debug_ast = raw.iter().any(|a| a == "--debug-ast");
-    let args: Vec<String> = raw
+    let mut args: Vec<String> = raw
         .into_iter()
         .filter(|a| a != "--debug-tokens" && a != "--debug-ast")
         .collect();
+
+    // `[scripts]` shortcuts: `kalvita demo` expands via kal.toml before
+    // anything else. Unknown names fall through to the file shorthand below,
+    // so projects without `[scripts]` behave exactly as before.
+    if let Some(first) = args.first().cloned() {
+        if !is_builtin_command(&first) && !first.starts_with('-') {
+            let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match project_script(&cwd, &first) {
+                Some(tokens) if !tokens.is_empty() => {
+                    if !is_builtin_command(&tokens[0]) && !tokens[0].ends_with(".kal") {
+                        eprintln!(
+                            "Script '{}' must expand to a kalvita command, got '{}'",
+                            first, tokens[0]
+                        );
+                        std::process::exit(2);
+                    }
+                    let mut expanded = tokens;
+                    expanded.extend(args.iter().skip(1).cloned());
+                    args = expanded;
+                }
+                Some(_) => {
+                    eprintln!(
+                        "Script '{}' is invalid (expected {} = \"<command>\" in kal.toml)",
+                        first, first
+                    );
+                    std::process::exit(2);
+                }
+                None => {}
+            }
+        }
+    }
 
     match args.first().map(String::as_str) {
         None => {
@@ -406,5 +481,39 @@ fn main() {
         }
         // Back-compat: `kalvita file.kal [flags]`.
         Some(path) => cmd_run(path, debug_tokens, debug_ast),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn script_fixture(toml: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kalvita_script_test_{}_{}",
+            std::process::id(),
+            toml.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kal.toml"), toml).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scripts_resolve_and_split() {
+        let dir = script_fixture("[project]\nname = \"x\"\n\n[scripts]\ndemo = \"run sample.kal\"\n");
+        assert_eq!(
+            project_script(&dir, "demo"),
+            Some(vec!["run".to_string(), "sample.kal".to_string()])
+        );
+        assert_eq!(project_script(&dir, "missing"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scripts_malformed_is_some_empty() {
+        let dir = script_fixture("[scripts]\nbad = run sample.kal\n");
+        assert_eq!(project_script(&dir, "bad"), Some(Vec::new()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

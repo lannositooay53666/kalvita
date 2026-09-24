@@ -79,6 +79,9 @@ pub enum Value {
     File {
         path: String,
     },
+    Db {
+        id: u64,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1107,9 +1110,14 @@ impl Parser {
                 self.index += 1;
                 Ok("file".to_string())
             }
+            // Same treatment for `db` handles from `db.Open(...)`.
+            Some(Token::Identifier(name)) if name == "db" => {
+                self.index += 1;
+                Ok("db".to_string())
+            }
             Some(Token::Identifier(name)) => {
                 return Err(format!(
-                    "Expected type name (string, number, logic, null, array, object, file, function), found '{}'",
+                    "Expected type name (string, number, logic, null, array, object, file, db, function), found '{}'",
                     name
                 ));
             }

@@ -1,0 +1,15 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    var local dir string = "tests/tmp_kal_fileops"
+    file.MkDir(var.dir)
+    var local f string = "${var.dir}/note.txt"
+    file.Write(var.f, "hi")
+    file.Append(var.f, "-there")
+    con.Print(file.Read(var.f))
+    con.Print(file.Exists(var.f))
+    con.Print(arr.Has(file.ListDir(var.dir), "note.txt"))
+    file.Remove(var.f)
+    con.Print(file.Exists(var.f))
+    file.Remove(var.dir)
+    con.Print("fileops ok")
+}

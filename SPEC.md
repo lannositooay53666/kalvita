@@ -24,7 +24,7 @@ var.hero.health = 50             // nested property/index assignment
 var.pair[0] = 99
 ```
 
-Types (`string number logic null array object file function`) are enforced at
+Types (`string number logic null array object file db function`) are enforced at
 write time: declaring, redeclaring, or assigning a mismatched value is a
 catchable `TypeError` (`expected number for var.n, got string`). `null`
 fits every slot. Redeclaring with a new type resets the slot. Anything else
@@ -96,8 +96,14 @@ try {
 
 `catch` blocks nest **inside** `try`, first match wins; `var.err` (`{type,
 message}`) is bound per handler. Runtime faults: `IndexError`, `DivZero`,
-`TypeError`, `ValueError`, `NameError`, `IOError` + custom `throw` types.
-Uncaught → `Runtime error: Uncaught Type: msg`.
+`TypeError`, `ValueError`, `NameError`, `IOError`, `DbError`, `AssertError`
++ custom `throw` types. Uncaught → `Runtime error: Uncaught Type: msg`.
+
+Bare `assert(cond[, msg])` throws catchable `AssertError` when `cond` is
+falsy (default message `"assertion failed"`). Passing files print nothing,
+so assertion-style tests pair with an empty (or minimal) `.expected` file
+under `kalvita test`. A user-defined `assert` function takes precedence
+over the builtin, same rule as `selectFile`.
 
 ## 7. Operators (precedence, loose → tight)
 
@@ -116,9 +122,37 @@ Strings interpolate: `"hi ${var.name}!"` (parsed as `+` concat).
 
 `con.Print(...)`, `con.Input([prompt])`, `math.Sin/Cos/Tan/Sqrt/Floor/Ceil/
 Abs/Pow/Min/Max/Clamp/Random`, `str.Len/Upper/Lower/Split/Join/Contains/
-Replace/Trim/Sub/From/ToNum`, `arr.Len/Push/Pop/Reverse/Sort/Join/Keys/Has/
-Get/Slice`, `time.Now()` (unix ms), `file.Read/Write`. Array builtins return
+Replace/Trim/Sub/From/ToNum/Lines/Chars/StartsWith/EndsWith/TrimPrefix/
+TrimSuffix/Repeat/ParseInt/ParseFloat/Match`, `arr.Len/Push/Pop/Reverse/
+Sort/Join/Keys/Has/Get/Slice`, `time.Now()` (unix ms), `time.Format(ms[,
+pattern])` (UTC, tokens `YYYY MM DD HH mm SS`), `file.Read/Write/Append/
+Exists/Remove/ListDir/MkDir`, `sys.Args/Getenv/Cwd`, `json.Parse/Stringify`,
+`http.Get/Post`, `db.Open/Close/Exec/Query`. Array builtins return
 new arrays (`var.xs = arr.Push(var.xs, 4)`).
+
+`str.Match(s, pattern)` is a full-string glob: `*` (any run), `?` (one
+char), `[...]` (class, `^` negates), `\` escapes. `str.Repeat` refuses
+results over 10M characters (`ValueError`).
+
+`sys.Args()` is the raw process argv (`[binary, subcommand, file, ...]`);
+`sys.Getenv(name)` is `null` when missing; `sys.Cwd()` is a path string.
+
+`json.Parse` maps objects/arrays/numbers/bools/null onto Kal values
+(nesting cap 128); `json.Stringify` sorts object keys for deterministic
+output. Numbers cross as f64 (`3` → `3.0`); functions, files, db handles,
+and errors are a `ValueError`.
+
+`http.Get(url)` returns the response body string; `http.Post(url, body[,
+content_type])` defaults to `text/plain`. Transport failures and non-2xx
+statuses are catchable `IOError`. Blocking client, 30s timeout.
+
+`db.Open(path)` (string or `file` value) returns a `db` handle;
+`db.Exec(db, sql[, params])` and `db.Query(db, sql[, params])` bind `?`
+params (integers stay integers, other numbers bind as floats, blobs come
+back as strings). `Query` returns an array of row objects;
+`db.Close(db)` releases the connection. Failures are catchable `DbError`.
+Note: index-then-property chains do not parse in reads — bind the row
+first (`var local first object = var.rows[0]`, then `var.first.name`).
 
 File variables hold paths selected up front — no I/O happens at select
 time, so missing files surface later as catchable `IOError`:
@@ -138,3 +172,15 @@ takes precedence over the builtin.
 `kalvita run [file]`, `check`, `fmt [--write]`, `test [dir]` (golden
 `<name>.kal` vs `<name>.expected`), `repl` (`:help :clear :quit`).
 Bare `kalvita` uses `kal.toml` `main`, else `sample.kal`.
+
+`kal.toml` may hold a `[scripts]` table of shortcuts:
+
+```toml
+[scripts]
+demo = "run sample.kal"
+```
+
+`kalvita demo` expands to the listed command (extra CLI args are
+appended); scripts cannot chain into other scripts. Unknown names fall
+back to the `file.kal` shorthand, so projects without `[scripts]`
+behave as before.
