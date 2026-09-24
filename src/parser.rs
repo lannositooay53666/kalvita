@@ -82,6 +82,28 @@ pub enum Value {
     Db {
         id: u64,
     },
+    Gui {
+        kind: GuiKind,
+        id: u64,
+    },
+}
+
+/// Widget kind for `Value::Gui` handles (`window`, `button`, ...).
+/// The kind doubles as the declared type name, so a window handle in
+/// a `button` slot is a `TypeError`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum GuiKind {
+    Window,
+    Button,
+}
+
+impl GuiKind {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            GuiKind::Window => "window",
+            GuiKind::Button => "button",
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -1115,9 +1137,17 @@ impl Parser {
                 self.index += 1;
                 Ok("db".to_string())
             }
+            // Widget handles (`window`, `button`) construct from strings:
+            // `var local w window = "Title"`. Same identifier trick so
+            // `w.Run(...)` keeps parsing as a method call.
+            Some(Token::Identifier(name)) if name == "window" || name == "button" => {
+                let type_name = name.clone();
+                self.index += 1;
+                Ok(type_name)
+            }
             Some(Token::Identifier(name)) => {
                 return Err(format!(
-                    "Expected type name (string, number, logic, null, array, object, file, db, function), found '{}'",
+                    "Expected type name (string, number, logic, null, array, object, file, db, window, button, function), found '{}'",
                     name
                 ));
             }

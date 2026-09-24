@@ -1,0 +1,38 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+// Kalvita GUI demo: windows, buttons, positions, events.
+// Run with a display: `cargo run -- run examples/gui_demo.kal`
+// Headless: `check` it, or run with KALVITA_GUI_TEST_FRAMES=5.
+kal.OnStart {
+    var global clicks number = 0
+
+    var local mywindow window = "Kalvita GUI Demo"
+    var local mybutton button = "Click me"
+    var local quitbutton button = "Quit"
+
+    mybutton.AttachToWindow(var.mywindow)
+    mybutton.SetPos(20, 20)
+    quitbutton.AttachToWindow(var.mywindow)
+    quitbutton.SetPos(20, 60)
+
+    mywindow.OnStart {
+        con.Print("window opened")
+    }
+
+    mybutton.OnClick {
+        var global clicks number = var.clicks + 1
+        con.Print("clicked")
+        pass.SetPos(20, 20)
+    }
+
+    quitbutton.OnClick {
+        con.Print("bye")
+        var.mywindow = null
+    }
+
+    mywindow.OnExit {
+        con.Print("window closed")
+    }
+
+    mywindow.Run()
+    con.Print("after run")
+}

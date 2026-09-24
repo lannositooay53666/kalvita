@@ -10,7 +10,9 @@ Every file starts with a header:
 [SCRIPTTYPE KALVITA VERSION 1]
 ```
 
-`kal.OnStart { ... }` is the entry event. Comments: `// line` and `.// block //.`
+`kal.OnStart { ... }` is the entry event. Widget event blocks
+(`mywindow.OnStart/OnExit`, `mybutton.OnClick`) are covered in §8.
+Comments: `// line` and `.// block //.` are stripped by the lexer.
 are stripped by the lexer.
 
 ## 2. Variables
@@ -24,7 +26,7 @@ var.hero.health = 50             // nested property/index assignment
 var.pair[0] = 99
 ```
 
-Types (`string number logic null array object file db function`) are enforced at
+Types (`string number logic null array object file db window button function`) are enforced at
 write time: declaring, redeclaring, or assigning a mismatched value is a
 catchable `TypeError` (`expected number for var.n, got string`). `null`
 fits every slot. Redeclaring with a new type resets the slot. Anything else
@@ -96,7 +98,7 @@ try {
 
 `catch` blocks nest **inside** `try`, first match wins; `var.err` (`{type,
 message}`) is bound per handler. Runtime faults: `IndexError`, `DivZero`,
-`TypeError`, `ValueError`, `NameError`, `IOError`, `DbError`, `AssertError`
+`TypeError`, `ValueError`, `NameError`, `IOError`, `DbError`, `GuiError`, `AssertError`
 + custom `throw` types. Uncaught → `Runtime error: Uncaught Type: msg`.
 
 Bare `assert(cond[, msg])` throws catchable `AssertError` when `cond` is
@@ -154,6 +156,64 @@ back as strings). `Query` returns an array of row objects;
 Note: index-then-property chains do not parse in reads — bind the row
 first (`var local first object = var.rows[0]`, then `var.first.name`).
 
+## 9. GUI
+
+Two layers: blocking native dialogs (`gui.*`, via rfd) and retained
+widgets (`window`/`button` types + method calls + event blocks, via
+eframe/egui). Headless machines: dialogs yield `null` (cancel or
+unavailable), `Run` is a catchable `IOError`.
+
+```kal
+var local picked string = gui.PickFile()
+var local answer string = gui.Message("Quit?", "Really quit", "warn", "yesno")
+```
+
+`gui.PickFile([filter_name, extensions])`, `gui.PickFolder()`,
+`gui.SaveFile([default_name])` return a path string or `null`.
+`gui.Message(title, text[, kind[, buttons]])` returns the pressed button
+(`"ok"`/`"cancel"`/`"yes"`/`"no"`); kind is `info`/`warn`/`error`,
+buttons are `ok`/`okcancel`/`yesno`/`yesnocancel`. Headless results are
+backend-defined (no display to click on), so portable scripts should
+treat a bare `Message(t, m)` as informational only.
+
+Widgets construct from strings by declaration — pure registry data, no
+display touch, so everything below runs headless except `Run`:
+
+```kal
+var local mywindow window = "Window Title"
+var local mybutton button = "Text"
+mybutton.AttachToWindow(var.mywindow)
+mybutton.SetPos(10, 20)
+
+mywindow.OnStart {
+    con.Print("opened")
+}
+mybutton.OnClick {
+    con.Print("clicked")
+    pass.SetPos(10, 40)        // `pass` = the widget, `arg`/`args` = []
+}
+mywindow.OnExit {
+    con.Print("closed")
+}
+mywindow.Run()                 // blocks until the window closes
+```
+
+- Assignment into a slot retitles in place (`var.mywindow = "New"`);
+  assigning `null` closes the widget (slot keeps its type; a later
+  string constructs anew). Methods on closed widgets are `GuiError`.
+- Event blocks append in definition order and compose with
+  `mybutton.OnClick(var.handler)` into one handler list. Blocks may sit
+  anywhere; each execution registers (calling the block twice fires it
+  twice). Valid pairs: window×`OnStart`/`OnExit`, button×`OnClick`;
+  anything else is `NameError`, non-widget receivers are `TypeError`.
+- `Run` pumps a single event loop (one draggable panel per Kal window
+  inside one native window in v1) until the window closes. `OnStart`
+  fires first, `OnExit` last — including after an uncaught handler
+  throw (fatals skip it). Handlers read all entry locals but write
+  locals call-locally: widgets talk to the script through `var global`
+  slots (same rule as cross-module calls). `Run` cannot nest.
+- Test hook: `KALVITA_GUI_TEST_FRAMES=N` auto-closes after N frames.
+
 File variables hold paths selected up front — no I/O happens at select
 time, so missing files surface later as catchable `IOError`:
 
@@ -167,7 +227,7 @@ con.Print(file.Read(var.myfile))
 (`file.Read("/tmp/notes.txt")`), and a user-defined `selectFile` function
 takes precedence over the builtin.
 
-## 9. CLI
+## 10. CLI
 
 `kalvita run [file]`, `check`, `fmt [--write]`, `test [dir]` (golden
 `<name>.kal` vs `<name>.expected`), `repl` (`:help :clear :quit`).

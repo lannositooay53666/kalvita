@@ -1,0 +1,33 @@
+[SCRIPTTYPE KALVITA VERSION 1]
+kal.OnStart {
+    var local w window = "T"
+    var local b button = "B"
+    b.AttachToWindow(var.w)
+    try {
+        b.Nope()
+        catch (NameError) { con.Print("caught-method") }
+    }
+    try {
+        w.OnClick {
+        }
+        catch (NameError) { con.Print("caught-event") }
+    }
+    try {
+        var local bad window = 42
+        catch (TypeError) { con.Print("caught-ctor") }
+    }
+    try {
+        b.SetPos(0 - 1, 0)
+        catch (ValueError) { con.Print("caught-pos") }
+    }
+    try {
+        b.AttachToWindow("nope")
+        catch (TypeError) { con.Print("caught-parent") }
+    }
+    try {
+        var.b = null
+        b.SetPos(1, 1)
+        catch (GuiError) { con.Print("caught-closed") }
+    }
+    con.Print("gui errors ok")
+}

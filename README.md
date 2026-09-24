@@ -48,8 +48,11 @@ Bare `cargo run` uses `kal.toml`'s `main`, else `sample.kal`.
 * Builtins: `con.Print/Input`, `math.*`, `str.*` (incl. `Match` glob,
   `Lines`, `ParseInt`), `arr.*`, `time.Now/Format`, `file.Read/Write/Append/
   Exists/ListDir/MkDir/Remove`, `sys.Args/Getenv/Cwd`, `json.Parse/Stringify`,
-  `http.Get/Post`, `db.Open/Exec/Query/Close`, bare `assert(cond[, msg])`
-  (catchable `AssertError`).
+  `http.Get/Post`, `db.Open/Exec/Query/Close`, `gui.PickFile/Message`,
+  bare `assert(cond[, msg])` (catchable `AssertError`).
+* GUI widgets: `var local w window = "Title"`, `var local b button = "Go"`,
+  `b.AttachToWindow(var.w)`, `b.SetPos(x, y)`, `w.OnStart/w.OnExit` +
+  `b.OnClick` event blocks, `w.Run()`. See `examples/gui_demo.kal`.
 
 The full reference lives in [SPEC.md](SPEC.md); runnable examples in
 `sample.kal` and `tests/`.

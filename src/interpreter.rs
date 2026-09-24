@@ -1,8 +1,8 @@
 //! Kalvita tree-walk interpreter: modules, execution, builtins.
 use crate::error::{RuntimeFault, fatal_err, throw_err, uncaught_message};
 use crate::parser::{
-    AssignTarget, BinaryOperator, CatchClause, Header, Parser, Program, Statement, UnaryOperator,
-    Value,
+    AssignTarget, BinaryOperator, CatchClause, GuiKind, Header, Parser, Program, Statement,
+    UnaryOperator, Value,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -109,6 +109,48 @@ impl LoadedModule {
     }
 }
 
+/// A widget registry entry. Entries are pure data until `Run` — no
+/// display touch, so declaration/attach/position/event code is
+/// headless-testable. `handlers` maps event name (`OnStart`, `OnExit`,
+/// `OnClick`) to callbacks in registration order; blocks and
+/// `OnClick(fn)` share the list.
+#[derive(Debug, Clone)]
+struct GuiEntry {
+    kind: GuiKind,
+    title: String,
+    parent: Option<u64>,
+    children: Vec<u64>,
+    pos: Option<(i32, i32)>,
+    handlers: HashMap<String, Vec<Value>>,
+    closed: bool,
+}
+
+impl GuiEntry {
+    fn window(title: String) -> Self {
+        Self {
+            kind: GuiKind::Window,
+            title,
+            parent: None,
+            children: Vec::new(),
+            pos: None,
+            handlers: HashMap::new(),
+            closed: false,
+        }
+    }
+
+    fn button(text: String) -> Self {
+        Self {
+            kind: GuiKind::Button,
+            title: text,
+            parent: None,
+            children: Vec::new(),
+            pos: None,
+            handlers: HashMap::new(),
+            closed: false,
+        }
+    }
+}
+
 /// Module loader + live global store. Threaded through the whole
 /// interpreter (`rt`) alongside the current file alias (`cur`).
 #[derive(Debug)]
@@ -119,6 +161,9 @@ pub struct ModuleRuntime {
     call_depth: Rc<Cell<usize>>,
     db_next: u64,
     db_conns: HashMap<u64, Rc<rusqlite::Connection>>,
+    gui_next: u64,
+    gui: HashMap<u64, GuiEntry>,
+    gui_running: bool,
 }
 
 impl Default for ModuleRuntime {
@@ -130,6 +175,9 @@ impl Default for ModuleRuntime {
             call_depth: Rc::new(Cell::new(0)),
             db_next: 1,
             db_conns: HashMap::new(),
+            gui_next: 1,
+            gui: HashMap::new(),
+            gui_running: false,
         }
     }
 }
@@ -1203,6 +1251,636 @@ fn invoke_db(
     }
 }
 
+/// Construct a widget registry entry from a title/text string.
+/// Pure data — no display touch, so this is headless-safe.
+fn gui_construct(rt: &mut ModuleRuntime, kind: GuiKind, text: String) -> Value {
+    let id = rt.gui_next;
+    rt.gui_next += 1;
+    let entry = match kind {
+        GuiKind::Window => GuiEntry::window(text),
+        GuiKind::Button => GuiEntry::button(text),
+    };
+    rt.gui.insert(id, entry);
+    Value::Gui { kind, id }
+}
+
+fn gui_kind_of(type_name: &str) -> Option<GuiKind> {
+    match type_name {
+        "window" => Some(GuiKind::Window),
+        "button" => Some(GuiKind::Button),
+        _ => None,
+    }
+}
+
+/// Constructor-by-declaration: `var local w window = "Title"`.
+/// Strings build widgets; anything else falls through to the normal
+/// `check_type` error (e.g. a number in a `window` slot is a `TypeError`).
+/// Callers guarantee `type_name` is a widget type.
+fn gui_declare_value(
+    rt: &mut ModuleRuntime,
+    slot: &str,
+    type_name: &str,
+    kind: GuiKind,
+    resolved: &Value,
+) -> Result<Value, RuntimeFault> {
+    match resolved {
+        Value::String(text) => Ok(gui_construct(rt, kind, text.clone())),
+        _ => {
+            check_type(slot, type_name, resolved)?;
+            Ok(resolved.clone())
+        }
+    }
+}
+
+/// Assignment into a `window`/`button` slot. Strings retitle in place,
+/// `null` closes the widget (slot keeps its type), a same-kind handle
+/// swaps in. Callers guarantee `declared` is a widget type.
+fn gui_assign_slot(
+    rt: &mut ModuleRuntime,
+    slot: &str,
+    declared: &str,
+    kind: GuiKind,
+    current: Option<Value>,
+    new_value: &Value,
+) -> Result<Value, RuntimeFault> {
+    match (current, new_value) {
+        (Some(Value::Gui { id, .. }), Value::String(text)) => {
+            match rt.gui.get_mut(&id) {
+                Some(entry) => {
+                    entry.title = text.clone();
+                    Ok(Value::Gui { kind, id })
+                }
+                None => Err(throw_err(
+                    "GuiError",
+                    format!("var.{}: widget was closed", slot),
+                )),
+            }
+        }
+        (Some(Value::Gui { id, .. }), Value::Null) => {
+            rt.gui.remove(&id);
+            Ok(Value::Null)
+        }
+        (_, Value::String(text)) => Ok(gui_construct(rt, kind, text.clone())),
+        (_, Value::Null) => Ok(Value::Null),
+        (Some(Value::Gui { kind: ck, id: cid }), Value::Gui { kind: nk, id: nid })
+            if ck == kind && *nk == kind =>
+        {
+            if !rt.gui.contains_key(nid) {
+                return Err(throw_err(
+                    "GuiError",
+                    format!("var.{}: widget was closed", slot),
+                ));
+            }
+            rt.gui.remove(&cid);
+            Ok(Value::Gui { kind, id: *nid })
+        }
+        (None, Value::Gui { kind: nk, id: nid }) if *nk == kind => {
+            if !rt.gui.contains_key(nid) {
+                return Err(throw_err(
+                    "GuiError",
+                    format!("var.{}: widget was closed", slot),
+                ));
+            }
+            Ok(Value::Gui { kind, id: *nid })
+        }
+        _ => {
+            check_type(slot, declared, new_value)?;
+            Ok(new_value.clone())
+        }
+    }
+}
+
+/// Dispatch a method call on a widget handle (`w.Run()`,
+/// `b.SetPos(x, y)`). Unknown methods are `NameError`, mirroring the
+/// unknown-builtin convention; operations on closed widgets are `GuiError`.
+#[allow(clippy::too_many_arguments)]
+fn gui_method(
+    kind: GuiKind,
+    id: u64,
+    method: &str,
+    args: &[Value],
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Option<Value>, RuntimeFault> {
+    if !rt.gui.contains_key(&id) {
+        return Err(throw_err(
+            "GuiError",
+            format!("{} was closed", kind.type_name()),
+        ));
+    }
+    let resolved = resolve_args(args, environment, types, rt, cur)?;
+    match (kind, method) {
+        (GuiKind::Window, "Run") => match resolved.as_slice() {
+            [] => gui_run_window(rt, cur, environment, types, id).map(|()| None::<Value>),
+            _ => Err(throw_err("ValueError", "Run expects no arguments")),
+        },
+        (GuiKind::Button, "AttachToWindow") => match resolved.as_slice() {
+            [target] => {
+                let window_id = match target {
+                    Value::Gui { kind: GuiKind::Window, id } => *id,
+                    other => {
+                        return Err(throw_err(
+                            "TypeError",
+                            format!(
+                                "AttachToWindow expects a window handle, got {:?}",
+                                other
+                            ),
+                        ))
+                    }
+                };
+                if !rt.gui.contains_key(&window_id) {
+                    return Err(throw_err("GuiError", "window was closed"));
+                }
+                if let Some(button) = rt.gui.get_mut(&id) {
+                    button.parent = Some(window_id);
+                }
+                if let Some(window) = rt.gui.get_mut(&window_id)
+                    && !window.children.contains(&id)
+                {
+                    window.children.push(id);
+                }
+                Ok(None)
+            }
+            _ => Err(throw_err(
+                "ValueError",
+                "AttachToWindow expects (window)",
+            )),
+        },
+        (GuiKind::Button, "SetPos") => match resolved.as_slice() {
+            [x, y] => {
+                let (x, y) = (expect_int(x, "SetPos")?, expect_int(y, "SetPos")?);
+                if x < 0 || y < 0 {
+                    return Err(throw_err(
+                        "ValueError",
+                        format!("SetPos coordinates must be >= 0, got ({}, {})", x, y),
+                    ));
+                }
+                match rt.gui.get_mut(&id) {
+                    Some(button) => {
+                        button.pos = Some((x as i32, y as i32));
+                        Ok(None)
+                    }
+                    None => Err(throw_err("GuiError", "button was closed")),
+                }
+            }
+            _ => Err(throw_err("ValueError", "SetPos expects (x, y)")),
+        },
+        (GuiKind::Button, "OnClick") => match resolved.as_slice() {
+            [handler] => match handler {
+                Value::Function { .. } => {
+                    match rt.gui.get_mut(&id) {
+                        Some(button) => {
+                            button
+                                .handlers
+                                .entry("OnClick".to_string())
+                                .or_default()
+                                .push(handler.clone());
+                            Ok(None)
+                        }
+                        None => Err(throw_err("GuiError", "button was closed")),
+                    }
+                }
+                other => Err(throw_err(
+                    "TypeError",
+                    format!("OnClick expects a function, got {:?}", other),
+                )),
+            },
+            _ => Err(throw_err("ValueError", "OnClick expects (function)")),
+        },
+        _ => Err(throw_err(
+            "NameError",
+            format!("Unknown {} method: {}", kind.type_name(), method),
+        )),
+    }
+}
+
+/// Register a widget event block (`mywindow.OnStart { ... }`). The body
+/// desugars to an anonymous no-param function appended to the widget's
+/// handler list, so blocks and `OnClick(fn)` compose in definition order.
+fn gui_register_event(
+    object: &str,
+    event: &str,
+    body: &[Statement],
+    environment: &HashMap<String, Value>,
+    _types: &HashMap<String, String>,
+    rt: &mut ModuleRuntime,
+    cur: &str,
+) -> Result<Flow, RuntimeFault> {
+    let handle = lookup_scoped(object, environment, rt, cur).ok_or_else(|| {
+        throw_err("NameError", format!("Unknown variable: {}", object))
+    })?;
+    let (kind, id) = match handle {
+        Value::Gui { kind, id } => (kind, id),
+        other => {
+            return Err(throw_err(
+                "TypeError",
+                format!(
+                    "{}.{}: {} is not a widget",
+                    object,
+                    event,
+                    value_type_name(&other)
+                ),
+            ))
+        }
+    };
+    let valid = matches!(
+        (kind, event),
+        (GuiKind::Window, "OnStart")
+            | (GuiKind::Window, "OnExit")
+            | (GuiKind::Button, "OnClick")
+    );
+    if !valid {
+        return Err(throw_err(
+            "NameError",
+            format!("Unknown {} event: {}", kind.type_name(), event),
+        ));
+    }
+    match rt.gui.get_mut(&id) {
+        Some(entry) => {
+            entry.handlers.entry(event.to_string()).or_default().push(
+                Value::Function {
+                    params: Vec::new(),
+                    defaults: HashMap::new(),
+                    body: body.to_vec(),
+                },
+            );
+            Ok(Flow::Normal)
+        }
+        None => Err(throw_err(
+            "GuiError",
+            format!("{} was closed", kind.type_name()),
+        )),
+    }
+}
+
+/// Fire a widget event: run each registered handler with the ambient
+/// scope cloned, `pass` bound to the widget, `arg`/`args` bound to `[]`
+/// (reserved for future payloads). Handler `return` ends that handler;
+/// `break`/`continue` are fatal misuse, mirroring function bodies.
+/// Globals written by handlers persist via the live store write-through.
+#[allow(clippy::too_many_arguments)]
+fn fire_gui_event(
+    rt: &mut ModuleRuntime,
+    alias: &str,
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    handle: &Value,
+    event: &str,
+    display: &str,
+) -> Result<(), RuntimeFault> {
+    let id = match handle {
+        Value::Gui { id, .. } => *id,
+        _ => return Err(fatal_err("gui handler fired on non-widget")),
+    };
+    let handlers = rt
+        .gui
+        .get(&id)
+        .map(|entry| entry.handlers.get(event).cloned().unwrap_or_default())
+        .unwrap_or_default();
+    for handler in handlers {
+        let (params, defaults, body) = match handler {
+            Value::Function { params, defaults, body } => (params, defaults, body),
+            _ => return Err(fatal_err("gui handler registry corrupted")),
+        };
+        let _guard = enter_call(rt)?;
+        let mut local_env = environment.clone();
+        let mut local_types = types.clone();
+        local_env.insert("pass".to_string(), handle.clone());
+        let empty = Value::Array(Vec::new());
+        local_env.insert("arg".to_string(), empty.clone());
+        local_env.insert("args".to_string(), empty);
+        bind_params(
+            &params,
+            &defaults,
+            &[],
+            environment,
+            types,
+            rt,
+            alias,
+            display,
+            &mut local_env,
+        )?;
+        for stmt in &body {
+            match execute_statement(stmt, &mut local_env, &mut local_types, rt, alias)? {
+                Flow::Normal => {}
+                Flow::Break => return Err(fatal_err("break outside loop")),
+                Flow::Continue => return Err(fatal_err("continue outside loop")),
+                Flow::Return(_) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Blocks pumping the OS event loop for one window until it closes.
+/// Single eframe loop, one viewport per registry window; clicks invoke
+/// Kal handlers synchronously on the UI thread. No display (or another
+/// backend failure) is a catchable `IOError`. Uncaught handler throws
+/// abort the run *after* `OnExit` fires; fatals skip `OnExit`.
+fn gui_run_window(
+    rt: &mut ModuleRuntime,
+    alias: &str,
+    environment: &HashMap<String, Value>,
+    types: &HashMap<String, String>,
+    id: u64,
+) -> Result<(), RuntimeFault> {
+    let title = match rt.gui.get(&id) {
+        Some(entry) if entry.kind == GuiKind::Window && !entry.closed => entry.title.clone(),
+        _ => {
+            return Err(throw_err(
+                "GuiError",
+                "cannot Run a closed or missing window",
+            ))
+        }
+    };
+    if rt.gui_running {
+        return Err(throw_err(
+            "GuiError",
+            "Run cannot nest inside a running window",
+        ));
+    }
+    let handle = Value::Gui { kind: GuiKind::Window, id };
+    // `OnStart` fires before the loop; an uncaught throw still runs
+    // `OnExit` on the way out (cleanup rule); fatals skip it.
+    let mut failure: Option<RuntimeFault> = match fire_gui_event(
+        rt, alias, environment, types, &handle, "OnStart", "OnStart",
+    ) {
+        Ok(()) => None,
+        Err(RuntimeFault::Throw(value)) => Some(RuntimeFault::Throw(value)),
+        Err(fatal) => return Err(fatal),
+    };
+    // eframe owns the app, so runtime state round-trips through shared
+    // ownership. Handler scope is a clone of the ambient scope (like a
+    // cross-module call): handlers READ all entry locals, but LOCAL writes
+    // stay call-local — widgets talk to the script through `var global`
+    // slots, which persist via the live-store write-through.
+    let real_rt = std::mem::take(rt);
+    let test_frames = std::env::var("KALVITA_GUI_TEST_FRAMES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok());
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(KalGuiState {
+        rt: real_rt,
+        alias: alias.to_string(),
+        env: environment.clone(),
+        types: types.clone(),
+        run_id: id,
+        done: false,
+        pending: None,
+        frames: 0,
+        test_frames,
+    }));
+    shared.borrow_mut().rt.gui_running = true;
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([480.0, 320.0]),
+        ..Default::default()
+    };
+    let app_shared = shared.clone();
+    let native_result = eframe::run_native(
+        "kalvita",
+        options,
+        Box::new(move |_cc| Ok(Box::new(KalApp { state: app_shared }))),
+    );
+    // Reclaim state (the app drops with the loop) and sync the runtime
+    // tables back (registry mutations like closed windows persist).
+    let mut state = match std::rc::Rc::try_unwrap(shared) {
+        Ok(cell) => cell.into_inner(),
+        Err(_) => {
+            *rt = ModuleRuntime::default();
+            return Err(fatal_err("gui run lost its state"));
+        }
+    };
+    state.rt.gui_running = false;
+    *rt = std::mem::replace(&mut state.rt, ModuleRuntime::default());
+    // Backend failure (no display, no GPU): OnStart side effects already
+    // happened, so OnExit still fires to keep the pairing invariant.
+    if let Err(e) = native_result {
+        let _ = fire_gui_event(rt, alias, environment, types, &handle, "OnExit", "OnExit");
+        return Err(throw_err(
+            "IOError",
+            format!("cannot open window: {}", e),
+        ));
+    }
+    if failure.is_none() {
+        failure = state.pending;
+    }
+    match failure {
+        None => {
+            let _ = fire_gui_event(rt, alias, environment, types, &handle, "OnExit", "OnExit");
+            Ok(())
+        }
+        Some(RuntimeFault::Throw(value)) => {
+            let _ = fire_gui_event(rt, alias, environment, types, &handle, "OnExit", "OnExit");
+            Err(RuntimeFault::Throw(value))
+        }
+        Some(fatal) => Err(fatal),
+    }
+}
+
+/// Mutable GUI-loop state shared with the eframe app.
+#[derive(Debug, Default)]
+struct KalGuiState {
+    rt: ModuleRuntime,
+    alias: String,
+    env: HashMap<String, Value>,
+    types: HashMap<String, String>,
+    run_id: u64,
+    done: bool,
+    pending: Option<RuntimeFault>,
+    frames: u64,
+    test_frames: Option<u64>,
+}
+
+/// Frozen render snapshot: cloned per frame so rendering never holds
+/// registry borrows while click dispatch mutates them.
+#[derive(Debug, Clone)]
+struct KalGuiWinSnap {
+    id: u64,
+    title: String,
+    buttons: Vec<KalGuiBtnSnap>,
+}
+
+#[derive(Debug, Clone)]
+struct KalGuiBtnSnap {
+    id: u64,
+    text: String,
+    pos: Option<(i32, i32)>,
+}
+
+struct KalApp {
+    state: std::rc::Rc<std::cell::RefCell<KalGuiState>>,
+}
+
+impl KalApp {
+    fn snapshot(rt: &ModuleRuntime, run_id: u64) -> Vec<KalGuiWinSnap> {
+        let mut wins = Vec::new();
+        let mut ids: Vec<u64> = rt
+            .gui
+            .iter()
+            .filter(|(_, e)| e.kind == GuiKind::Window && !e.closed)
+            .map(|(id, _)| *id)
+            .collect();
+        // The run window renders first (root viewport); the rest follow.
+        ids.sort_by_key(|id| if *id == run_id { 0 } else { 1 });
+        for wid in ids {
+            let Some(window) = rt.gui.get(&wid) else {
+                continue;
+            };
+            let mut buttons = Vec::new();
+            for bid in &window.children {
+                if let Some(button) = rt.gui.get(bid) {
+                    if button.kind == GuiKind::Button && !button.closed {
+                        buttons.push(KalGuiBtnSnap {
+                            id: *bid,
+                            text: button.title.clone(),
+                            pos: button.pos,
+                        });
+                    }
+                }
+            }
+            // Unattached buttons land in the run window's flow.
+            if wid == run_id {
+                let mut orphans: Vec<u64> = rt
+                    .gui
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.kind == GuiKind::Button && !e.closed && e.parent.is_none()
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                orphans.sort();
+                for bid in orphans {
+                    if buttons.iter().any(|b| b.id == bid) {
+                        continue;
+                    }
+                    if let Some(button) = rt.gui.get(&bid) {
+                        buttons.push(KalGuiBtnSnap {
+                            id: bid,
+                            text: button.title.clone(),
+                            pos: button.pos,
+                        });
+                    }
+                }
+            }
+            wins.push(KalGuiWinSnap {
+                id: wid,
+                title: window.title.clone(),
+                buttons,
+            });
+        }
+        wins
+    }
+
+    fn render_buttons(ui: &mut egui::Ui, buttons: &[KalGuiBtnSnap], clicks: &mut Vec<u64>) {
+        for button in buttons {
+            let clicked = match button.pos {
+                Some((x, y)) => ui
+                    .put(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x as f32, y as f32),
+                            egui::vec2(140.0, 30.0),
+                        ),
+                        egui::Button::new(&button.text),
+                    )
+                    .clicked(),
+                None => ui.button(&button.text).clicked(),
+            };
+            if clicked {
+                clicks.push(button.id);
+            }
+        }
+    }
+}
+
+impl eframe::App for KalApp {
+    /// Once per pass, no painting: frame bookkeeping, test-hook close,
+    /// run-window liveness, and pending-error shutdown.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut state = self.state.borrow_mut();
+        state.frames += 1;
+        if let Some(n) = state.test_frames {
+            // Headless/smoke runs have no input to drive repaints.
+            ctx.request_repaint();
+            if state.frames >= n {
+                state.done = true;
+            }
+        }
+        if !state.rt.gui.contains_key(&state.run_id) {
+            state.done = true; // run window was null-closed from a handler
+        }
+        if state.done || state.pending.is_some() {
+            state.done = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Root viewport: one draggable `egui::Window` per Kal window
+    /// (single native window in v1; true multi-viewport is follow-up).
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            // Native X: let the close proceed; the loop drains on its own.
+            self.state.borrow_mut().done = true;
+            return;
+        }
+        let snapshot = {
+            let state = self.state.borrow();
+            Self::snapshot(&state.rt, state.run_id)
+        };
+        let mut clicks: Vec<u64> = Vec::new();
+        let mut closed_windows: Vec<u64> = Vec::new();
+        for win in &snapshot {
+            let mut open = true;
+            egui::Window::new(&win.title)
+                .id(egui::Id::new(("kalvita", win.id)))
+                .open(&mut open)
+                .show(ui.ctx(), |window_ui| {
+                    Self::render_buttons(window_ui, &win.buttons, &mut clicks);
+                });
+            if !open {
+                closed_windows.push(win.id);
+            }
+        }
+        // Apply closes, then dispatch clicks (registry mutations visible
+        // at once). Disjoint field borrows through one `RefMut` are fine.
+        let mut state = self.state.borrow_mut();
+        for wid in closed_windows {
+            state.rt.gui.remove(&wid);
+            if wid == state.run_id {
+                state.done = true;
+            }
+        }
+        let alias = state.alias.clone();
+        for bid in clicks {
+            if state.pending.is_some() {
+                break;
+            }
+            let handle = Value::Gui { kind: GuiKind::Button, id: bid };
+            let state_ref = &mut *state;
+            match fire_gui_event(
+                &mut state_ref.rt,
+                &alias,
+                &state_ref.env,
+                &state_ref.types,
+                &handle,
+                "OnClick",
+                "OnClick",
+            ) {
+                Ok(()) => {}
+                Err(fault) => {
+                    state_ref.pending = Some(fault);
+                    state_ref.done = true;
+                }
+            }
+        }
+        if state.done {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
 /// Accept a path string or an open `file` variable for file builtins.
 fn resolve_file_target(target: &Value) -> Result<String, RuntimeFault> {
     match target {
@@ -1846,6 +2524,142 @@ fn invoke_function(
                 )),
             }
         }
+        Some(obj) if obj == "gui" => {
+            let resolved = resolve_args(args, environment, types, rt, cur)?;
+            match function {
+                "PickFile" => match resolved.as_slice() {
+                    [] => Ok(rfd::FileDialog::new()
+                        .pick_file()
+                        .map(|p| Value::String(p.display().to_string()))
+                        .or(Some(Value::Null))),
+                    [filter_name, exts] => {
+                        let filter_name = expect_string(filter_name, "PickFile")?;
+                        let exts = expect_array(exts, "PickFile")?;
+                        let mut extensions = Vec::with_capacity(exts.len());
+                        for ext in &exts {
+                            match ext {
+                                Value::String(s) => extensions.push(s.clone()),
+                                other => {
+                                    return Err(throw_err(
+                                        "TypeError",
+                                        format!(
+                                            "PickFile extensions must be strings, got {:?}",
+                                            other
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        Ok(rfd::FileDialog::new()
+                            .add_filter(filter_name, &extensions)
+                            .pick_file()
+                            .map(|p| Value::String(p.display().to_string()))
+                            .or(Some(Value::Null)))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "PickFile expects () or (filter_name, extensions)",
+                    )),
+                },
+                "PickFolder" => match resolved.as_slice() {
+                    [] => Ok(rfd::FileDialog::new()
+                        .pick_folder()
+                        .map(|p| Value::String(p.display().to_string()))
+                        .or(Some(Value::Null))),
+                    _ => Err(throw_err("ValueError", "PickFolder expects no arguments")),
+                },
+                "SaveFile" => match resolved.as_slice() {
+                    [] => Ok(rfd::FileDialog::new()
+                        .save_file()
+                        .map(|p| Value::String(p.display().to_string()))
+                        .or(Some(Value::Null))),
+                    [default_name] => {
+                        let default_name = expect_string(default_name, "SaveFile")?;
+                        Ok(rfd::FileDialog::new()
+                            .set_file_name(default_name)
+                            .save_file()
+                            .map(|p| Value::String(p.display().to_string()))
+                            .or(Some(Value::Null)))
+                    }
+                    _ => Err(throw_err(
+                        "ValueError",
+                        "SaveFile expects () or (default_name)",
+                    )),
+                },
+                "Message" => {
+                    let (title, text, kind, buttons) = match resolved.as_slice() {
+                        [title, text] => (
+                            expect_string(title, "Message")?,
+                            expect_string(text, "Message")?,
+                            "info".to_string(),
+                            "ok".to_string(),
+                        ),
+                        [title, text, kind] => (
+                            expect_string(title, "Message")?,
+                            expect_string(text, "Message")?,
+                            expect_string(kind, "Message")?,
+                            "ok".to_string(),
+                        ),
+                        [title, text, kind, buttons] => (
+                            expect_string(title, "Message")?,
+                            expect_string(text, "Message")?,
+                            expect_string(kind, "Message")?,
+                            expect_string(buttons, "Message")?,
+                        ),
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Message expects (title, text[, kind[, buttons]])",
+                            ))
+                        }
+                    };
+                    let level = match kind.as_str() {
+                        "info" => rfd::MessageLevel::Info,
+                        "warn" | "warning" => rfd::MessageLevel::Warning,
+                        "error" => rfd::MessageLevel::Error,
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Message kind must be info, warn, or error",
+                            ))
+                        }
+                    };
+                    let buttons = match buttons.as_str() {
+                        "ok" => rfd::MessageButtons::Ok,
+                        "okcancel" => rfd::MessageButtons::OkCancel,
+                        "yesno" => rfd::MessageButtons::YesNo,
+                        "yesnocancel" => rfd::MessageButtons::YesNoCancel,
+                        _ => {
+                            return Err(throw_err(
+                                "ValueError",
+                                "Message buttons must be ok, okcancel, yesno, or yesnocancel",
+                            ))
+                        }
+                    };
+                    match rfd::MessageDialog::new()
+                        .set_title(title)
+                        .set_description(text)
+                        .set_level(level)
+                        .set_buttons(buttons)
+                        .show()
+                    {
+                        rfd::MessageDialogResult::Yes => Ok(Some(Value::String("yes".to_string()))),
+                        rfd::MessageDialogResult::No => Ok(Some(Value::String("no".to_string()))),
+                        rfd::MessageDialogResult::Cancel => {
+                            Ok(Some(Value::String("cancel".to_string())))
+                        }
+                        rfd::MessageDialogResult::Ok => Ok(Some(Value::String("ok".to_string()))),
+                        rfd::MessageDialogResult::Custom(choice) => {
+                            Ok(Some(Value::String(choice)))
+                        }
+                    }
+                }
+                _ => Err(throw_err(
+                    "NameError",
+                    format!("Unknown gui function: {}", function),
+                )),
+            }
+        }
         Some(obj) if obj == "http" => {
             let resolved = resolve_args(args, environment, types, rt, cur)?;
             match function {
@@ -2046,6 +2860,33 @@ fn invoke_function(
                 }
             }
 
+            // Widget-handle methods (`mybutton.SetPos(...)`): when the
+            // receiver variable holds a `Gui` handle, dispatch to Rust.
+            // A null receiver with a widget-method name means the widget
+            // was closed (or never created) — `GuiError`, not a bare
+            // `NameError`. Anything else falls through to the
+            // bare-function path below, so non-widget calls behave
+            // exactly as before.
+            if let Some(obj) = object {
+                match lookup_scoped(obj, environment, rt, cur) {
+                    Some(Value::Gui { kind, id }) => {
+                        return gui_method(kind, id, function, args, environment, types, rt, cur);
+                    }
+                    Some(Value::Null)
+                        if matches!(
+                            function,
+                            "Run" | "AttachToWindow" | "SetPos" | "OnClick"
+                        ) =>
+                    {
+                        return Err(throw_err(
+                            "GuiError",
+                            format!("{} was closed", obj),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+
             let callee = match resolve_value(&Value::Variable(function.to_string()), environment, types, rt, cur)
                 .or_else(|_| {
                     lookup_scoped(function, environment, rt, cur).ok_or_else(|| throw_err("NameError", format!("Unknown variable: {}", function)))
@@ -2131,6 +2972,8 @@ fn check_type(slot: &str, type_name: &str, value: &Value) -> Result<(), RuntimeF
         ("object", Value::Object(_)) => true,
         ("file", Value::File { .. }) => true,
         ("db", Value::Db { .. }) => true,
+        ("window", Value::Gui { kind: GuiKind::Window, .. }) => true,
+        ("button", Value::Gui { kind: GuiKind::Button, .. }) => true,
         ("function", Value::Function { .. }) => true,
         _ => false,
     };
@@ -2159,6 +3002,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::Object(_) => "object",
         Value::File { .. } => "file",
         Value::Db { .. } => "db",
+        Value::Gui { kind, .. } => kind.type_name(),
         Value::Array(_) => "array",
         Value::Index { .. } => "index",
         Value::FunctionCall { .. } => "function-call",
@@ -2188,8 +3032,14 @@ fn execute_statement(
                 Value::Function { .. } => value.clone(),
                 _ => resolve_value(value, environment, types, rt, cur)?,
             };
-            check_type(name, type_name, &resolved)?;
-            environment.insert(format!("var.{}", name), resolved);
+            let stored = match gui_kind_of(type_name) {
+                Some(kind) => gui_declare_value(rt, name, type_name, kind, &resolved)?,
+                None => {
+                    check_type(name, type_name, &resolved)?;
+                    resolved
+                }
+            };
+            environment.insert(format!("var.{}", name), stored);
             types.insert(format!("var.{}", name), type_name.clone());
             Ok(Flow::Normal)
         }
@@ -2205,12 +3055,18 @@ fn execute_statement(
                 Value::Function { .. } => value.clone(),
                 _ => resolve_value(value, environment, types, rt, cur)?,
             };
-            check_type(name, type_name, &resolved)?;
-            environment.insert(format!("var.{}", name), resolved.clone());
+            let stored = match gui_kind_of(type_name) {
+                Some(kind) => gui_declare_value(rt, name, type_name, kind, &resolved)?,
+                None => {
+                    check_type(name, type_name, &resolved)?;
+                    resolved.clone()
+                }
+            };
+            environment.insert(format!("var.{}", name), stored.clone());
             types.insert(format!("var.{}", name), type_name.clone());
             rt.ensure_module(cur);
             let module = rt.modules.get_mut(cur).unwrap();
-            module.globals.insert(format!("var.{}", name), resolved);
+            module.globals.insert(format!("var.{}", name), stored);
             module.global_names.insert(name.clone());
             module.global_types.insert(name.clone(), type_name.clone());
             Ok(Flow::Normal)
@@ -2277,8 +3133,13 @@ fn execute_statement(
                         Err(fatal_err("return can only be used inside a function body"))
                     }
                 }
-            } else {
+            } else if object == "kal" {
+                // Reserved for future `kal.*` events; ignored for now.
                 Ok(Flow::Normal)
+            } else {
+                // Widget event blocks (`mywindow.OnStart { ... }`): resolve
+                // the handle and append the body to its handler list.
+                gui_register_event(object, name, body, environment, types, rt, cur)
             }
         }
         Statement::If {
@@ -2614,12 +3475,28 @@ fn write_assign_target(
                     format!("Cannot assign to undeclared variable: var.{}", name),
                 ));
             }
-            // Enforce the slot's declared type (if any).
+            // Enforce the slot's declared type (if any). Widget slots
+            // (`window`/`button`) retitle on strings and close on `null`.
             if let Some(declared) = types
                 .get(&key)
                 .cloned()
                 .or_else(|| rt.lookup_type(cur, &key))
             {
+                if let Some(kind) = gui_kind_of(&declared) {
+                    let current = lookup_scoped(name, environment, rt, cur);
+                    let stored =
+                        gui_assign_slot(rt, name, &declared, kind, current, &new_value)?;
+                    environment.insert(key.clone(), stored.clone());
+                    if rt.is_global(cur, name) {
+                        rt.ensure_module(cur);
+                        rt.modules
+                            .get_mut(cur)
+                            .unwrap()
+                            .globals
+                            .insert(key, stored);
+                    }
+                    return Ok(());
+                }
                 check_type(name, &declared, &new_value)?;
             }
             environment.insert(key.clone(), new_value.clone());
@@ -3110,6 +3987,7 @@ fn format_value(value: Value) -> String {
         Value::Error { error_type, message } => format!("{}: {}", error_type, message),
         Value::File { path } => format!("file({})", path),
         Value::Db { id } => format!("db({})", id),
+        Value::Gui { kind, id } => format!("{}({})", kind.type_name(), id),
         Value::Array(items) => {
             let rendered: Vec<String> = items.into_iter().map(format_value).collect();
             format!("[{}]", rendered.join(", "))
@@ -4589,5 +5467,291 @@ mod tests {
         );
         let (_, err) = run_with_types(&source);
         assert!(err.unwrap().starts_with("IOError"));
+    }
+
+    /// Harness that keeps the runtime: GUI tests assert on the widget
+    /// registry (`rt.gui`) as well as the script env.
+    fn run_gui(source: &str) -> (HashMap<String, Value>, ModuleRuntime, Option<String>) {
+        let program = Parser::parse(source).unwrap();
+        let body = match &program.statements[0] {
+            Statement::Event { body, .. } => body.clone(),
+            _ => panic!("expected event"),
+        };
+        let mut rt = ModuleRuntime::default();
+        let mut env = HashMap::new();
+        let mut types = HashMap::new();
+        for stmt in &body {
+            match execute_statement(stmt, &mut env, &mut types, &mut rt, TEST_ALIAS) {
+                Ok(_) => {}
+                Err(RuntimeFault::Fatal(msg)) => {
+                    return (env, rt, Some(format!("fatal: {}", msg)))
+                }
+                Err(RuntimeFault::Throw(Value::Error { error_type, message })) => {
+                    return (env, rt, Some(format!("{}: {}", error_type, message)))
+                }
+                Err(RuntimeFault::Throw(other)) => {
+                    return (env, rt, Some(format!("throw: {:?}", other)))
+                }
+            }
+        }
+        (env, rt, None)
+    }
+
+    fn gui_id(env: &HashMap<String, Value>, name: &str) -> u64 {
+        match env.get(name) {
+            Some(Value::Gui { id, .. }) => *id,
+            other => panic!("{} is not a widget: {:?}", name, other),
+        }
+    }
+
+    #[test]
+    fn gui_declare_attach_position_assign() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local mywindow window = \"Window Title\"\n    var local mybutton button = \"Text\"\n    mybutton.AttachToWindow(var.mywindow)\n    mybutton.SetPos(10, 20)\n    var.mybutton = \"Clicked!\"\n    var.mywindow = \"New Title\"\n}\n";
+        let (env, rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let wid = gui_id(&env, "var.mywindow");
+        let bid = gui_id(&env, "var.mybutton");
+        assert_eq!(rt.gui[&wid].title, "New Title");
+        assert_eq!(rt.gui[&bid].title, "Clicked!");
+        assert_eq!(rt.gui[&bid].parent, Some(wid));
+        assert_eq!(rt.gui[&bid].pos, Some((10, 20)));
+        assert!(rt.gui[&wid].children.contains(&bid));
+        // Null closes the widget; the slot keeps its type.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local w window = \"T\"\n    var local b button = \"B\"\n    b.AttachToWindow(var.w)\n    var.b = null\n}\n";
+        let (env, rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        assert_eq!(env.get("var.b"), Some(&Value::Null));
+        assert!(rt.gui.values().all(|e| e.kind != GuiKind::Button));
+        // Reassigning a string to the nulled slot constructs anew.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local b button = \"B\"\n    var.b = null\n    var.b = \"Again\"\n}\n";
+        let (env, rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let bid = gui_id(&env, "var.b");
+        assert_eq!(rt.gui[&bid].title, "Again");
+        // Error table: all headless, no display touch.
+        let cases = [
+            ("var local w window = 42", "TypeError"),
+            ("var local b button = 42", "TypeError"),
+            (
+                "var local w window = \"T\"\n    var local b button = var.w",
+                "TypeError",
+            ),
+            (
+                "var local w window = \"T\"\n    var local c window = var.w",
+                "ok:copy",
+            ),
+        ];
+        for (stmt, want) in cases {
+            let source = format!(
+                "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {{\n    {}\n}}\n",
+                stmt
+            );
+            let (_, _, err) = run_gui(&source);
+            if want == "ok:copy" {
+                assert!(err.is_none(), "{} should pass: {:?}", stmt, err);
+                continue;
+            }
+            let err = err.unwrap_or_else(|| panic!("{} should fail", stmt));
+            assert!(err.starts_with(want), "{}: got {}", stmt, err);
+        }
+    }
+
+    #[test]
+    fn gui_method_validation() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local w window = \"T\"\n    var local b button = \"B\"\n}\n";
+        let (env, mut rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let mut types = HashMap::new();
+        types.insert("var.w".to_string(), "window".to_string());
+        types.insert("var.b".to_string(), "button".to_string());
+        // Unknown methods are NameError; bad args are typed faults.
+        let w = env["var.w"].clone();
+        let b = env["var.b"].clone();
+        let no_args: Vec<Value> = Vec::new();
+        let err = gui_method(GuiKind::Button, gui_id(&env, "var.b"), "Nope", &no_args, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "NameError"));
+        let err = gui_method(GuiKind::Window, gui_id(&env, "var.w"), "OnClick", &no_args, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "NameError"));
+        let bad_parent = vec![Value::String("x".to_string())];
+        let err = gui_method(GuiKind::Button, gui_id(&env, "var.b"), "AttachToWindow", &bad_parent, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "TypeError"));
+        let neg = vec![Value::Number(0.0 - 1.0), Value::Number(0.0)];
+        let err = gui_method(GuiKind::Button, gui_id(&env, "var.b"), "SetPos", &neg, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "ValueError"));
+        let not_fn = vec![Value::Number(1.0)];
+        let err = gui_method(GuiKind::Button, gui_id(&env, "var.b"), "OnClick", &not_fn, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "TypeError"));
+        let _ = (w, b);
+    }
+
+    #[test]
+    fn gui_events_register_fire_in_order() {
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var global log array = []\n    var global seen button = null\n    var global nargs number = 0 - 1\n    var local w window = \"T\"\n    var local b button = \"B\"\n    b.AttachToWindow(var.w)\n    b.OnClick {\n        var global log array = arr.Push(var.log, \"first\")\n    }\n    var local extra function = () {\n        var global log array = arr.Push(var.log, \"second\")\n        var global seen button = pass\n        var global nargs number = arr.Len(arg)\n    }\n    b.OnClick(var.extra)\n    b.OnClick {\n        var global log array = arr.Push(var.log, \"third\")\n    }\n    w.OnStart {\n        var global log array = arr.Push(var.log, \"start\")\n    }\n    w.OnExit {\n        var global log array = arr.Push(var.log, \"exit\")\n    }\n}\n";
+        let (env, mut rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let bid = gui_id(&env, "var.b");
+        let wid = gui_id(&env, "var.w");
+        assert_eq!(rt.gui[&bid].handlers["OnClick"].len(), 3);
+        assert_eq!(rt.gui[&wid].handlers["OnStart"].len(), 1);
+        // Fire click: block, function, block — in order, with pass/arg.
+        let handle = Value::Gui { kind: GuiKind::Button, id: bid };
+        let mut types = HashMap::new();
+        fire_gui_event(&mut rt, TEST_ALIAS, &env, &types, &handle, "OnClick", "OnClick").unwrap();
+        let log = rt.read_global(TEST_ALIAS, "log").expect("log global");
+        assert_eq!(
+            log,
+            Value::Array(vec![
+                Value::String("first".to_string()),
+                Value::String("second".to_string()),
+                Value::String("third".to_string()),
+            ])
+        );
+        assert_eq!(
+            rt.read_global(TEST_ALIAS, "seen"),
+            Some(Value::Gui { kind: GuiKind::Button, id: bid })
+        );
+        assert_eq!(
+            rt.read_global(TEST_ALIAS, "nargs"),
+            Some(Value::Number(0.0))
+        );
+        // Start/exit fire on demand too.
+        let whandle = Value::Gui { kind: GuiKind::Window, id: wid };
+        fire_gui_event(&mut rt, TEST_ALIAS, &env, &types, &whandle, "OnStart", "OnStart").unwrap();
+        fire_gui_event(&mut rt, TEST_ALIAS, &env, &types, &whandle, "OnExit", "OnExit").unwrap();
+        let log = rt.read_global(TEST_ALIAS, "log").expect("log global");
+        assert_eq!(
+            log,
+            Value::Array(vec![
+                Value::String("first".to_string()),
+                Value::String("second".to_string()),
+                Value::String("third".to_string()),
+                Value::String("start".to_string()),
+                Value::String("exit".to_string()),
+            ])
+        );
+        // Unknown events and non-widget receivers are typed faults.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local w window = \"T\"\n    w.OnClick {\n    }\n}\n";
+        let (_, _, err) = run_gui(source);
+        assert!(err.unwrap().starts_with("NameError"));
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local s string = \"x\"\n    s.OnClick {\n    }\n}\n";
+        let (_, _, err) = run_gui(source);
+        assert!(err.unwrap().starts_with("TypeError"));
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    nosuch.OnClick {\n    }\n}\n";
+        let (_, _, err) = run_gui(source);
+        assert!(err.unwrap().starts_with("NameError"));
+    }
+
+    #[test]
+    fn gui_handler_abort_stops_chain() {
+        // An uncaught throw aborts the remaining handlers with its fault.
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var global log array = []\n    var local b button = \"B\"\n    b.OnClick {\n        var global log array = arr.Push(var.log, \"one\")\n    }\n    b.OnClick {\n        throw(Boom, \"bang\")\n    }\n    b.OnClick {\n        var global log array = arr.Push(var.log, \"three\")\n    }\n}\n";
+        let (env, mut rt, err) = run_gui(source);
+        assert!(err.is_none(), "unexpected: {:?}", err);
+        let bid = gui_id(&env, "var.b");
+        let handle = Value::Gui { kind: GuiKind::Button, id: bid };
+        let types = HashMap::new();
+        let err = fire_gui_event(&mut rt, TEST_ALIAS, &env, &types, &handle, "OnClick", "OnClick")
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "Boom"));
+        let log = rt.read_global(TEST_ALIAS, "log").expect("log global");
+        assert_eq!(
+            log,
+            Value::Array(vec![Value::String("one".to_string())])
+        );
+    }
+
+    #[test]
+    fn gui_dialog_validation_needs_no_display() {
+        // Only pre-backend validation is tested: success paths would
+        // block on a real dialog, so they stay manual/gated.
+        let env: HashMap<String, Value> = HashMap::new();
+        let mut rt = ModuleRuntime::default();
+        let types = HashMap::new();
+        let bad = vec![Value::Number(1.0), Value::Number(2.0)];
+        let err = invoke_function(Some("gui"), None, "PickFile", &bad, &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "TypeError"));
+        let err = invoke_function(
+            Some("gui"),
+            None,
+            "Message",
+            &[
+                Value::String("t".to_string()),
+                Value::String("m".to_string()),
+                Value::String("bogus".to_string()),
+            ],
+            &env,
+            &types,
+            &mut rt,
+            TEST_ALIAS,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "ValueError"));
+        let err = invoke_function(Some("gui"), None, "Nope", &[], &env, &types, &mut rt, TEST_ALIAS)
+            .unwrap_err();
+        assert!(matches!(err, RuntimeFault::Throw(Value::Error { error_type, .. }) if error_type == "NameError"));
+    }
+
+    fn gui_display_present() -> bool {
+        std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok()
+    }
+
+    #[test]
+    fn gui_run_without_display_is_ioerror() {
+        if gui_display_present() {
+            return; // needs a real headless box; covered by CI convention
+        }
+        let source = "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local w window = \"T\"\n    w.Run()\n}\n";
+        let (_, _, err) = run_gui(source);
+        let err = err.expect("Run without display should fail");
+        assert!(err.starts_with("IOError"), "got: {}", err);
+    }
+
+    #[test]
+    fn gui_run_pumps_and_returns_with_hook() {
+        if !gui_display_present() {
+            return;
+        }
+        // winit requires the main thread, and `cargo test` runs on
+        // spawned threads — so the real loop runs in a child process
+        // (same pattern as the golden harness), auto-closing after
+        // 3 frames via the test hook.
+        let dir = std::env::temp_dir().join("kalvita_gui_run_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let script = dir.join("run_hook.kal");
+        std::fs::write(
+            &script,
+            "[SCRIPTTYPE KALVITA VERSION 1]\nkal.OnStart {\n    var local w window = \"Hook\"\n    var local b button = \"B\"\n    b.AttachToWindow(var.w)\n    w.OnStart {\n        con.Print(\"hook-start\")\n    }\n    w.OnExit {\n        con.Print(\"hook-exit\")\n    }\n    w.Run()\n    con.Print(\"hook-after\")\n}\n",
+        )
+        .unwrap();
+        let exe = std::env::current_exe().unwrap();
+        // Under `cargo test`, current_exe is the harness
+        // (`target/debug/deps/kalvita-<hash>`); the CLI lives next to
+        // `deps/` as `target/debug/kalvita`.
+        let mut exe = exe;
+        exe.pop();
+        if exe.file_name().and_then(|n| n.to_str()) == Some("deps") {
+            exe.pop();
+        }
+        exe.push("kalvita");
+        let output = std::process::Command::new(&exe)
+            .arg("run")
+            .arg(&script)
+            .env("KALVITA_GUI_TEST_FRAMES", "3")
+            .output()
+            .expect("spawn child");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert_eq!(stdout, "hook-start\nhook-exit\nhook-after\n");
     }
 }
